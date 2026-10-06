@@ -1,0 +1,10 @@
+{
+  "name": "Recipe Press",
+  "short_name": "Recipe Press",
+  "description": "Prepare photographed cookbook recipes for your Notion food library.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#151613",
+  "theme_color": "#dfff55",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
