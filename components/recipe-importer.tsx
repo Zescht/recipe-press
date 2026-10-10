@@ -7,6 +7,7 @@ import {
   ChevronRight,
   CircleAlert,
   CircleCheck,
+  Crop,
   FileText,
   ImagePlus,
   LoaderCircle,
@@ -17,7 +18,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   clearImageBlobs,
   deleteImageBlob,
@@ -27,6 +28,10 @@ import {
 
 type FlowStep = "upload" | "assign" | "groups" | "processing" | "review" | "results";
 
+type CropPoint = { x: number; y: number };
+type CropQuad = [CropPoint, CropPoint, CropPoint, CropPoint];
+type OcrRegions = { ingredients: CropQuad; steps: CropQuad };
+
 type BatchImage = {
   id: string;
   name: string;
@@ -34,6 +39,7 @@ type BatchImage = {
   samplePath?: string;
   group: number | null;
   excluded: boolean;
+  ocrRegions?: OcrRegions;
 };
 
 type Draft = {
@@ -234,6 +240,239 @@ function parseRecipeText(rawText: string, fallbackTitle: string, confidence: num
   };
 }
 
+const defaultOcrRegions: OcrRegions = {
+  ingredients: [
+    { x: 0.55, y: 0.22 },
+    { x: 0.93, y: 0.22 },
+    { x: 0.93, y: 0.9 },
+    { x: 0.55, y: 0.9 },
+  ],
+  steps: [
+    { x: 0.08, y: 0.43 },
+    { x: 0.53, y: 0.43 },
+    { x: 0.53, y: 0.9 },
+    { x: 0.08, y: 0.9 },
+  ],
+};
+
+function copyRegions(regions: OcrRegions): OcrRegions {
+  return {
+    ingredients: regions.ingredients.map((point) => ({ ...point })) as CropQuad,
+    steps: regions.steps.map((point) => ({ ...point })) as CropQuad,
+  };
+}
+
+function normalizeOcrLines(rawText: string) {
+  return rawText
+    .replace(/\r/g, "")
+    .replace(/-\n(?=[a-zäöüß])/g, "")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+function formatDefinedIngredients(rawText: string) {
+  const heading = /^(zutaten|ingredients?)\b[:\s-]*/i;
+  const serving = /^für\s+\d+.*(personen|portionen)/i;
+  const quantity = /^(?:[-•·]\s*)?(?:\d|[½¼¾⅓⅔]|ein(?:e|en)?\b|salz\b|pfeffer\b)/i;
+  const lines = normalizeOcrLines(rawText)
+    .map((line) => line.replace(heading, "").trim())
+    .filter((line) => line && !serving.test(line));
+  const firstIngredient = lines.findIndex((line) => quantity.test(line));
+  const source = firstIngredient >= 0 ? lines.slice(firstIngredient) : lines;
+  const ingredients: string[] = [];
+
+  source.forEach((line) => {
+    const cleaned = line.replace(/^[-•·]\s*/, "").trim();
+    if (!cleaned) return;
+    if (quantity.test(cleaned) || !ingredients.length) ingredients.push(cleaned);
+    else ingredients[ingredients.length - 1] = `${ingredients[ingredients.length - 1]} ${cleaned}`;
+  });
+
+  return ingredients
+    .map((line, index) => ({ line, index, rank: ingredientRank(line) }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ line }) => `- ${line}`)
+    .join("\n");
+}
+
+function formatDefinedSteps(rawText: string) {
+  const heading = /^(zubereitung|anleitung|schritte?|steps?|method|directions?|instructions?)\b[:\s-]*/i;
+  const lines = normalizeOcrLines(rawText)
+    .map((line) => line.replace(heading, "").trim())
+    .filter(Boolean);
+  const steps: string[] = [];
+
+  lines.forEach((line) => {
+    if (/^\d+\s*[.)]\s*/.test(line) || !steps.length) steps.push(line);
+    else steps[steps.length - 1] = `${steps[steps.length - 1]} ${line}`;
+  });
+
+  return steps.join("\n\n");
+}
+
+function triangleTransform(source: CropPoint[], destination: CropPoint[]) {
+  const [s0, s1, s2] = source;
+  const [d0, d1, d2] = destination;
+  const denominator = s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+  return {
+    a: (d0.x * (s1.y - s2.y) + d1.x * (s2.y - s0.y) + d2.x * (s0.y - s1.y)) / denominator,
+    b: (d0.y * (s1.y - s2.y) + d1.y * (s2.y - s0.y) + d2.y * (s0.y - s1.y)) / denominator,
+    c: (d0.x * (s2.x - s1.x) + d1.x * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) / denominator,
+    d: (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.y * (s1.x - s0.x)) / denominator,
+    e: (d0.x * (s1.x * s2.y - s2.x * s1.y) + d1.x * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / denominator,
+    f: (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.y * (s0.x * s1.y - s1.x * s0.y)) / denominator,
+  };
+}
+
+async function cropImageForOcr(imageUrl: string, quad: CropQuad) {
+  const image = new Image();
+  image.decoding = "async";
+  image.src = imageUrl;
+  await image.decode();
+
+  const source = quad.map((point) => ({
+    x: point.x * image.naturalWidth,
+    y: point.y * image.naturalHeight,
+  })) as CropQuad;
+  const distance = (first: CropPoint, second: CropPoint) => Math.hypot(second.x - first.x, second.y - first.y);
+  const naturalWidth = Math.max(1, Math.round((distance(source[0], source[1]) + distance(source[3], source[2])) / 2));
+  const naturalHeight = Math.max(1, Math.round((distance(source[0], source[3]) + distance(source[1], source[2])) / 2));
+  const scale = Math.min(1, 2400 / Math.max(naturalWidth, naturalHeight));
+  const width = Math.max(1, Math.round(naturalWidth * scale));
+  const height = Math.max(1, Math.round(naturalHeight * scale));
+  const destination: CropQuad = [
+    { x: 0, y: 0 },
+    { x: width, y: 0 },
+    { x: width, y: height },
+    { x: 0, y: height },
+  ];
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas is unavailable.");
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, width, height);
+
+  ([[0, 1, 2], [0, 2, 3]] as const).forEach((indexes) => {
+    const sourceTriangle = indexes.map((index) => source[index]);
+    const destinationTriangle = indexes.map((index) => destination[index]);
+    const matrix = triangleTransform(sourceTriangle, destinationTriangle);
+    context.save();
+    context.beginPath();
+    context.moveTo(destinationTriangle[0].x, destinationTriangle[0].y);
+    context.lineTo(destinationTriangle[1].x, destinationTriangle[1].y);
+    context.lineTo(destinationTriangle[2].x, destinationTriangle[2].y);
+    context.closePath();
+    context.clip();
+    context.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+    context.drawImage(image, 0, 0);
+    context.restore();
+  });
+
+  return await new Promise<string>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) reject(new Error("The selected region could not be prepared."));
+      else resolve(URL.createObjectURL(blob));
+    }, "image/jpeg", 0.96);
+  });
+}
+
+function RegionEditor({
+  image,
+  onCancel,
+  onSave,
+}: {
+  image: BatchImage;
+  onCancel: () => void;
+  onSave: (regions: OcrRegions) => void;
+}) {
+  const [phase, setPhase] = useState<keyof OcrRegions>("ingredients");
+  const [regions, setRegions] = useState<OcrRegions>(() => copyRegions(image.ocrRegions ?? defaultOcrRegions));
+  const overlayRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [onCancel]);
+
+  function moveCorner(event: ReactPointerEvent<HTMLButtonElement>, cornerIndex: number) {
+    if (!event.currentTarget.hasPointerCapture(event.pointerId) || !overlayRef.current) return;
+    const bounds = overlayRef.current.getBoundingClientRect();
+    const point = {
+      x: Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)),
+      y: Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height)),
+    };
+    setRegions((current) => {
+      const next = copyRegions(current);
+      next[phase][cornerIndex] = point;
+      return next;
+    });
+  }
+
+  const activeQuad = regions[phase];
+  const inactivePhase: keyof OcrRegions = phase === "ingredients" ? "steps" : "ingredients";
+  const polygon = (quad: CropQuad) => quad.map((point) => `${point.x * 100},${point.y * 100}`).join(" ");
+
+  return (
+    <div className="region-editor" role="dialog" aria-modal="true" aria-label={`Define ${phase} region`}>
+      <header className="region-editor__header">
+        <div>
+          <p className="eyebrow">Region {phase === "ingredients" ? "1" : "2"} of 2</p>
+          <h2>Define {phase}</h2>
+        </div>
+        <button className="region-editor__close" type="button" onClick={onCancel} aria-label="Close region editor"><X /></button>
+      </header>
+
+      <div className="region-editor__canvas">
+        <div className="region-editor__image-wrap">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={image.url} alt={image.name} draggable={false} />
+          <div className="region-editor__overlay" ref={overlayRef}>
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <polygon className="region-editor__polygon region-editor__polygon--inactive" points={polygon(regions[inactivePhase])} />
+              <polygon className={`region-editor__polygon region-editor__polygon--${phase}`} points={polygon(activeQuad)} />
+            </svg>
+            {activeQuad.map((point, index) => (
+              <button
+                className={`region-handle region-handle--${phase}`}
+                style={{ left: `${point.x * 100}%`, top: `${point.y * 100}%` }}
+                type="button"
+                key={`${phase}-${index}`}
+                aria-label={`Move ${phase} corner ${index + 1}`}
+                onPointerDown={(event) => event.currentTarget.setPointerCapture(event.pointerId)}
+                onPointerMove={(event) => moveCorner(event, index)}
+              ><span>{index + 1}</span></button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <footer className="region-editor__footer">
+        <p>Drag all four corners around only the <strong>{phase}</strong> text.</p>
+        <div className="region-editor__legend"><span className="is-ingredients" /> Ingredients <span className="is-steps" /> Steps</div>
+        <div className="region-editor__actions">
+          {phase === "steps" ? <button className="button region-editor__back" type="button" onClick={() => setPhase("ingredients")}><ChevronLeft size={18} /> Back</button> : <button className="button region-editor__back" type="button" onClick={onCancel}>Cancel</button>}
+          {phase === "ingredients" ? (
+            <button className="button button--primary" type="button" onClick={() => setPhase("steps")}>Next: steps <ChevronRight size={18} /></button>
+          ) : (
+            <button className="button button--primary" type="button" onClick={() => onSave(regions)}><Check size={18} /> Save regions</button>
+          )}
+        </div>
+      </footer>
+    </div>
+  );
+}
+
 export function RecipeImporter() {
   const [flow, setFlow] = useState<FlowStep>("upload");
   const [images, setImages] = useState<BatchImage[]>([]);
@@ -245,6 +484,7 @@ export function RecipeImporter() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [undoDraft, setUndoDraft] = useState<string | null>(null);
+  const [defineImageId, setDefineImageId] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState("");
   const [processingMessage, setProcessingMessage] = useState("Preparing the OCR reader…");
   const [processingProgress, setProcessingProgress] = useState(0);
@@ -300,6 +540,7 @@ export function RecipeImporter() {
         samplePath: image.samplePath,
         group: image.group,
         excluded: image.excluded,
+        ocrRegions: image.ocrRegions,
       })),
       drafts,
       imageIndex,
@@ -328,6 +569,7 @@ export function RecipeImporter() {
   const remainingDrafts = drafts.filter((draft) => !draft.deleted);
   const completedDrafts = remainingDrafts.filter((draft) => draft.visited && draftIsComplete(draft));
   const canSubmit = remainingDrafts.length > 0 && completedDrafts.length === remainingDrafts.length;
+  const defineImage = images.find((image) => image.id === defineImageId);
 
   async function addFiles(files: File[]) {
     const accepted = files.filter((file) => file.type.startsWith("image/"));
@@ -425,6 +667,14 @@ export function RecipeImporter() {
     setImageIndex(findNextUnresolved(imageIndex, nextImages));
   }
 
+  function saveOcrRegions(regions: OcrRegions) {
+    if (!defineImageId) return;
+    setImages((current) =>
+      current.map((image) => image.id === defineImageId ? { ...image, ocrRegions: regions } : image),
+    );
+    setDefineImageId(null);
+  }
+
   function createNewGroup() {
     const nextGroup = Math.max(0, ...assignedGroups) + 1;
     assignCurrent(nextGroup);
@@ -485,7 +735,9 @@ export function RecipeImporter() {
     setProcessingMessage("Preparing the OCR reader…");
 
     let nextDrafts: Draft[] = [];
-    const sampleOnly = groups.every((group) => group.images.some((image) => image.id === "sample-text"));
+    const sampleOnly = groups.every((group) =>
+      group.images.some((image) => image.id === "sample-text" && !image.ocrRegions),
+    );
 
     if (sampleOnly) {
       await new Promise((resolve) => window.setTimeout(resolve, 650));
@@ -494,36 +746,79 @@ export function RecipeImporter() {
     } else {
       let worker: Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | undefined;
       try {
-        const { createWorker } = await import("tesseract.js");
-        worker = await createWorker(["eng", "deu"], 1, {
+        const { createWorker, PSM } = await import("tesseract.js");
+        worker = await createWorker(["deu"], 1, {
           logger(message) {
             if (message.status === "recognizing text" && typeof message.progress === "number") {
               setProcessingProgress(Math.min(0.96, message.progress));
             }
           },
         });
+        await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
 
         for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
           const group = groups[groupIndex];
           setProcessingMessage(`Reading recipe ${groupIndex + 1} of ${groups.length}…`);
-          const pages: string[] = [];
-          const confidences: number[] = [];
-
-          for (const image of group.images) {
-            const result = await worker.recognize(image.url);
-            const text = result.data.text.trim();
-            if (text.length >= 12) {
-              pages.push(text);
-              confidences.push(result.data.confidence ?? 0);
-            }
-          }
-
-          const rawText = pages.join("\n\n");
-          const averageConfidence = confidences.length
-            ? confidences.reduce((total, value) => total + value, 0) / confidences.length
-            : 0;
           const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
-          const parsed = parseRecipeText(rawText, fallbackTitle, averageConfidence);
+          const definedImages = group.images.filter((image) => image.ocrRegions);
+          let parsed: ParsedRecipe;
+
+          if (definedImages.length) {
+            const ingredientPages: string[] = [];
+            const stepPages: string[] = [];
+            const confidences: number[] = [];
+
+            for (const image of definedImages) {
+              const ingredientsUrl = await cropImageForOcr(image.url, image.ocrRegions!.ingredients);
+              const stepsUrl = await cropImageForOcr(image.url, image.ocrRegions!.steps);
+              try {
+                const ingredientResult = await worker.recognize(ingredientsUrl);
+                const stepResult = await worker.recognize(stepsUrl);
+                if (ingredientResult.data.text.trim()) ingredientPages.push(ingredientResult.data.text.trim());
+                if (stepResult.data.text.trim()) stepPages.push(stepResult.data.text.trim());
+                confidences.push(ingredientResult.data.confidence ?? 0, stepResult.data.confidence ?? 0);
+              } finally {
+                URL.revokeObjectURL(ingredientsUrl);
+                URL.revokeObjectURL(stepsUrl);
+              }
+            }
+
+            const titleResult = await worker.recognize(definedImages[0].url);
+            const title = parseRecipeText(titleResult.data.text, fallbackTitle, titleResult.data.confidence ?? 0).title;
+            const ingredients = formatDefinedIngredients(ingredientPages.join("\n"));
+            const steps = formatDefinedSteps(stepPages.join("\n"));
+            const averageConfidence = confidences.length
+              ? confidences.reduce((total, value) => total + value, 0) / confidences.length
+              : 0;
+            const warnings = ["Ingredients and steps were read from your defined regions; verify quantities against the photo."];
+            if (averageConfidence < 62) warnings.push("OCR confidence is low, so this draft needs extra checking.");
+            if (!ingredients) warnings.push("No ingredient text was found inside the selected region.");
+            if (!steps) warnings.push("No preparation text was found inside the selected region.");
+            parsed = {
+              title,
+              ingredients: ingredients || "[Review and add the extracted ingredients]",
+              steps: steps || "[Review and add the preparation steps]",
+              warning: warnings.join(" "),
+            };
+          } else {
+            const pages: string[] = [];
+            const confidences: number[] = [];
+
+            for (const image of group.images) {
+              const result = await worker.recognize(image.url);
+              const text = result.data.text.trim();
+              if (text.length >= 12) {
+                pages.push(text);
+                confidences.push(result.data.confidence ?? 0);
+              }
+            }
+
+            const rawText = pages.join("\n\n");
+            const averageConfidence = confidences.length
+              ? confidences.reduce((total, value) => total + value, 0) / confidences.length
+              : 0;
+            parsed = parseRecipeText(rawText, fallbackTitle, averageConfidence);
+          }
           nextDrafts.push(buildDraft(group, parsed));
           setProcessingProgress((groupIndex + 1) / groups.length);
         }
@@ -769,19 +1064,29 @@ export function RecipeImporter() {
 
           <div className="group-picker">
             <p>Which recipe does this belong to?</p>
-            <div className="group-buttons">
-              {(assignedGroups.length ? assignedGroups : [1]).map((group) => {
-                const count = images.filter((image) => image.group === group && !image.excluded).length;
-                const selected = images[imageIndex].group === group && !images[imageIndex].excluded;
-                return (
-                  <button className={selected ? "is-selected" : ""} type="button" key={group} onClick={() => assignCurrent(group)} aria-pressed={selected}>
-                    <strong>{group}</strong>{count ? <small>{count}</small> : null}
-                  </button>
-                );
-              })}
-              {assignedGroups.length ? (
-                <button className="group-new" type="button" onClick={createNewGroup}><Plus size={20} /><span>New</span></button>
-              ) : null}
+            <div className="group-picker__actions">
+              <div className="group-buttons">
+                {(assignedGroups.length ? assignedGroups : [1]).map((group) => {
+                  const count = images.filter((image) => image.group === group && !image.excluded).length;
+                  const selected = images[imageIndex].group === group && !images[imageIndex].excluded;
+                  return (
+                    <button className={selected ? "is-selected" : ""} type="button" key={group} onClick={() => assignCurrent(group)} aria-pressed={selected}>
+                      <strong>{group}</strong>{count ? <small>{count}</small> : null}
+                    </button>
+                  );
+                })}
+                {assignedGroups.length ? (
+                  <button className="group-new" type="button" onClick={createNewGroup}><Plus size={20} /><span>New</span></button>
+                ) : null}
+              </div>
+              <button
+                className={`define-button ${images[imageIndex].ocrRegions ? "is-defined" : ""}`}
+                type="button"
+                onClick={() => setDefineImageId(images[imageIndex].id)}
+              >
+                {images[imageIndex].ocrRegions ? <Check size={17} /> : <Crop size={17} />}
+                {images[imageIndex].ocrRegions ? "Defined" : "Define"}
+              </button>
             </div>
             <button className={`exclude-button ${images[imageIndex].excluded ? "is-selected" : ""}`} type="button" onClick={excludeCurrent}>
               <X size={17} /> {images[imageIndex].excluded ? "Excluded" : "Exclude this image"}
@@ -965,6 +1270,10 @@ export function RecipeImporter() {
 
           <button className="button button--primary button--large" type="button" onClick={() => void startNewBatch()}><RotateCcw size={18} /> Start another batch</button>
         </section>
+      ) : null}
+
+      {defineImage ? (
+        <RegionEditor image={defineImage} onCancel={() => setDefineImageId(null)} onSave={saveOcrRegions} />
       ) : null}
 
       {deleteTarget ? (
