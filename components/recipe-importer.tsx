@@ -69,6 +69,7 @@ type PersistedState = {
 
 const STORAGE_KEY = "recipe-press:batch:v1";
 const PUBLIC_BASE = import.meta.env.BASE_URL || "/";
+const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/extract-recipe";
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
@@ -149,7 +150,20 @@ type ParsedRecipe = {
   title: string;
   ingredients: string;
   steps: string;
+  cookingTime?: string;
+  servings?: string;
+  comment?: string;
   warning?: string;
+};
+
+type QwenRecipe = {
+  title: string;
+  servings: string;
+  cookingTime: string;
+  comment: string;
+  ingredients: string[];
+  phases: { name: string; steps: string[] }[];
+  warnings: string[];
 };
 
 function ingredientRank(line: string) {
@@ -371,12 +385,86 @@ async function cropImageForOcr(imageUrl: string, quad: CropQuad) {
     context.restore();
   });
 
-  return await new Promise<string>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (!blob) reject(new Error("The selected region could not be prepared."));
-      else resolve(URL.createObjectURL(blob));
-    }, "image/jpeg", 0.96);
+  return canvas.toDataURL("image/jpeg", 0.9);
+}
+
+async function prepareFullImageForAi(imageUrl: string) {
+  const image = new Image();
+  image.decoding = "async";
+  image.src = imageUrl;
+  await image.decode();
+
+  const scale = Math.min(1, 1800 / Math.max(image.naturalWidth, image.naturalHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas is unavailable.");
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.84);
+}
+
+function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string): ParsedRecipe {
+  const ingredients = recipe.ingredients
+    .map((line) => line.replace(/^[-â€¢Â·]\s*/, "").trim())
+    .filter(Boolean)
+    .map((line, index) => ({ line, index, rank: ingredientRank(line) }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ line }) => `- ${line}`)
+    .join("\n");
+  const steps = recipe.phases
+    .filter((phase) => phase.steps?.length)
+    .map((phase) => {
+      const name = phase.name.trim() || "Zubereitung";
+      return `${name}\n${phase.steps.map((step, index) => `${index + 1}. ${step.trim()}`).join("\n")}`;
+    })
+    .join("\n\n");
+
+  return {
+    title: recipe.title.trim() || fallbackTitle,
+    ingredients: ingredients || "[Review and add the extracted ingredients]",
+    steps: steps || "[Review and add the preparation steps]",
+    cookingTime: recipe.cookingTime?.trim() || "",
+    servings: recipe.servings?.trim() || "",
+    comment: recipe.comment?.trim() || "",
+    warning: recipe.warnings?.filter(Boolean).join(" ") || undefined,
+  };
+}
+
+async function extractRecipeWithQwen(group: { number: number; images: BatchImage[] }) {
+  const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
+  const definedImages = group.images.filter((image) => image.ocrRegions).slice(0, 4);
+  let titleImages: string[];
+  let ingredientImages: string[];
+  let stepImages: string[];
+
+  if (definedImages.length) {
+    titleImages = [await prepareFullImageForAi(definedImages[0].url)];
+    ingredientImages = await Promise.all(
+      definedImages.map((image) => cropImageForOcr(image.url, image.ocrRegions!.ingredients)),
+    );
+    stepImages = await Promise.all(
+      definedImages.map((image) => cropImageForOcr(image.url, image.ocrRegions!.steps)),
+    );
+  } else {
+    const fullImages = await Promise.all(group.images.slice(0, 4).map((image) => prepareFullImageForAi(image.url)));
+    titleImages = fullImages.slice(0, 1);
+    ingredientImages = fullImages;
+    stepImages = fullImages;
+  }
+
+  const response = await fetch(RECIPE_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ titleImages, ingredientImages, stepImages }),
   });
+  const payload = await response.json() as { recipe?: QwenRecipe; error?: string };
+  if (!response.ok || !payload.recipe) {
+    throw new Error(payload.error || "Qwen could not create the recipe draft.");
+  }
+  return formatQwenRecipe(payload.recipe, fallbackTitle);
 }
 
 function RegionEditor({
@@ -486,7 +574,7 @@ export function RecipeImporter() {
   const [undoDraft, setUndoDraft] = useState<string | null>(null);
   const [defineImageId, setDefineImageId] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState("");
-  const [processingMessage, setProcessingMessage] = useState("Preparing the OCR reader…");
+  const [processingMessage, setProcessingMessage] = useState("Connecting securely to Qwen…");
   const [processingProgress, setProcessingProgress] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -717,11 +805,11 @@ export function RecipeImporter() {
       difficulty: "",
       ingredients: isSample ? sampleIngredients : parsed?.ingredients || "[Review and add the extracted ingredients]",
       steps: isSample ? sampleSteps : parsed?.steps || "[Review and add the preparation steps]",
-      cookingTime: isSample ? "Gesamtzeit: ca. 1 Std." : "",
-      servings: isSample ? "2" : "",
+      cookingTime: isSample ? "Gesamtzeit: ca. 1 Std." : parsed?.cookingTime || "",
+      servings: isSample ? "2" : parsed?.servings || "",
       comment: isSample
         ? "Für 4 Personen als Vorspeise oder Beilage, für 2 Personen als Hauptgericht."
-        : "",
+        : parsed?.comment || "",
       link: "",
       visited: false,
       deleted: false,
@@ -732,7 +820,7 @@ export function RecipeImporter() {
   async function createDrafts() {
     setFlow("processing");
     setProcessingProgress(0);
-    setProcessingMessage("Preparing the OCR reader…");
+    setProcessingMessage("Connecting securely to Qwen…");
 
     let nextDrafts: Draft[] = [];
     const sampleOnly = groups.every((group) =>
@@ -746,79 +834,78 @@ export function RecipeImporter() {
     } else {
       let worker: Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | undefined;
       try {
-        const { createWorker, PSM } = await import("tesseract.js");
-        worker = await createWorker(["deu"], 1, {
-          logger(message) {
-            if (message.status === "recognizing text" && typeof message.progress === "number") {
-              setProcessingProgress(Math.min(0.96, message.progress));
-            }
-          },
-        });
-        await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
-
         for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
           const group = groups[groupIndex];
-          setProcessingMessage(`Reading recipe ${groupIndex + 1} of ${groups.length}…`);
-          const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
-          const definedImages = group.images.filter((image) => image.ocrRegions);
+          setProcessingMessage(`Qwen is reading recipe ${groupIndex + 1} of ${groups.length}…`);
           let parsed: ParsedRecipe;
 
-          if (definedImages.length) {
-            const ingredientPages: string[] = [];
-            const stepPages: string[] = [];
-            const confidences: number[] = [];
+          try {
+            parsed = await extractRecipeWithQwen(group);
+          } catch {
+            setProcessingMessage(`Qwen was unavailable. Using German browser OCR for recipe ${groupIndex + 1}…`);
+            if (!worker) {
+              const { createWorker, PSM } = await import("tesseract.js");
+              worker = await createWorker(["deu"], 1, {
+                logger(message) {
+                  if (message.status === "recognizing text" && typeof message.progress === "number") {
+                    setProcessingProgress(Math.min(0.96, message.progress));
+                  }
+                },
+              });
+              await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
+            }
 
-            for (const image of definedImages) {
-              const ingredientsUrl = await cropImageForOcr(image.url, image.ocrRegions!.ingredients);
-              const stepsUrl = await cropImageForOcr(image.url, image.ocrRegions!.steps);
-              try {
+            const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
+            const definedImages = group.images.filter((image) => image.ocrRegions);
+            if (definedImages.length) {
+              const ingredientPages: string[] = [];
+              const stepPages: string[] = [];
+              const confidences: number[] = [];
+
+              for (const image of definedImages) {
+                const ingredientsUrl = await cropImageForOcr(image.url, image.ocrRegions!.ingredients);
+                const stepsUrl = await cropImageForOcr(image.url, image.ocrRegions!.steps);
                 const ingredientResult = await worker.recognize(ingredientsUrl);
                 const stepResult = await worker.recognize(stepsUrl);
                 if (ingredientResult.data.text.trim()) ingredientPages.push(ingredientResult.data.text.trim());
                 if (stepResult.data.text.trim()) stepPages.push(stepResult.data.text.trim());
                 confidences.push(ingredientResult.data.confidence ?? 0, stepResult.data.confidence ?? 0);
-              } finally {
-                URL.revokeObjectURL(ingredientsUrl);
-                URL.revokeObjectURL(stepsUrl);
               }
-            }
 
-            const titleResult = await worker.recognize(definedImages[0].url);
-            const title = parseRecipeText(titleResult.data.text, fallbackTitle, titleResult.data.confidence ?? 0).title;
-            const ingredients = formatDefinedIngredients(ingredientPages.join("\n"));
-            const steps = formatDefinedSteps(stepPages.join("\n"));
-            const averageConfidence = confidences.length
-              ? confidences.reduce((total, value) => total + value, 0) / confidences.length
-              : 0;
-            const warnings = ["Ingredients and steps were read from your defined regions; verify quantities against the photo."];
-            if (averageConfidence < 62) warnings.push("OCR confidence is low, so this draft needs extra checking.");
-            if (!ingredients) warnings.push("No ingredient text was found inside the selected region.");
-            if (!steps) warnings.push("No preparation text was found inside the selected region.");
-            parsed = {
-              title,
-              ingredients: ingredients || "[Review and add the extracted ingredients]",
-              steps: steps || "[Review and add the preparation steps]",
-              warning: warnings.join(" "),
-            };
-          } else {
-            const pages: string[] = [];
-            const confidences: number[] = [];
-
-            for (const image of group.images) {
-              const result = await worker.recognize(image.url);
-              const text = result.data.text.trim();
-              if (text.length >= 12) {
-                pages.push(text);
-                confidences.push(result.data.confidence ?? 0);
+              const titleResult = await worker.recognize(definedImages[0].url);
+              const title = parseRecipeText(titleResult.data.text, fallbackTitle, titleResult.data.confidence ?? 0).title;
+              const ingredients = formatDefinedIngredients(ingredientPages.join("\n"));
+              const steps = formatDefinedSteps(stepPages.join("\n"));
+              const averageConfidence = confidences.length
+                ? confidences.reduce((total, value) => total + value, 0) / confidences.length
+                : 0;
+              const warnings = ["Qwen was unavailable, so German browser OCR was used. Verify quantities and column order."];
+              if (averageConfidence < 62) warnings.push("OCR confidence is low, so this draft needs extra checking.");
+              parsed = {
+                title,
+                ingredients: ingredients || "[Review and add the extracted ingredients]",
+                steps: steps || "[Review and add the preparation steps]",
+                warning: warnings.join(" "),
+              };
+            } else {
+              const pages: string[] = [];
+              const confidences: number[] = [];
+              for (const image of group.images) {
+                const result = await worker.recognize(image.url);
+                const text = result.data.text.trim();
+                if (text.length >= 12) {
+                  pages.push(text);
+                  confidences.push(result.data.confidence ?? 0);
+                }
               }
+              const averageConfidence = confidences.length
+                ? confidences.reduce((total, value) => total + value, 0) / confidences.length
+                : 0;
+              parsed = parseRecipeText(pages.join("\n\n"), fallbackTitle, averageConfidence);
+              parsed.warning = `Qwen was unavailable, so German browser OCR was used. ${parsed.warning || ""}`.trim();
             }
-
-            const rawText = pages.join("\n\n");
-            const averageConfidence = confidences.length
-              ? confidences.reduce((total, value) => total + value, 0) / confidences.length
-              : 0;
-            parsed = parseRecipeText(rawText, fallbackTitle, averageConfidence);
           }
+
           nextDrafts.push(buildDraft(group, parsed));
           setProcessingProgress((groupIndex + 1) / groups.length);
         }
@@ -828,7 +915,7 @@ export function RecipeImporter() {
             title: stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`),
             ingredients: "[Review and add the extracted ingredients]",
             steps: "[Review and add the preparation steps]",
-            warning: "OCR could not start. Check your connection and try creating the drafts again.",
+            warning: "Neither Qwen nor the browser OCR could create this draft. Check your connection and try again.",
           }),
         );
       } finally {
@@ -1153,8 +1240,8 @@ export function RecipeImporter() {
           <div className="processing-mark"><FileText size={35} /><Sparkles size={19} /></div>
           <p className="eyebrow">Creating {groups.length} draft{groups.length === 1 ? "" : "s"}</p>
           <h1>Reading the cookbook pages…</h1>
-          <p>{processingMessage} The first run downloads the English and German OCR models.</p>
-          <div className="processing-bar" role="progressbar" aria-label="OCR progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(processingProgress * 100)}>
+          <p>{processingMessage} Your selected recipe regions are processed through the private API connection.</p>
+          <div className="processing-bar" role="progressbar" aria-label="Recipe extraction progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(processingProgress * 100)}>
             <span style={{ width: `${Math.max(8, processingProgress * 100)}%` }} />
           </div>
         </section>

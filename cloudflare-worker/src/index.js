@@ -63,6 +63,11 @@ const SYSTEM_PROMPT = `Du transkribierst deutschsprachige Kochrezepte aus Fotos.
 Arbeite ausschließlich aus dem sichtbaren Inhalt. Korrigiere eindeutige OCR-, Trennungs- und Zeilenumbruchfehler, aber erfinde niemals Mengen, Temperaturen, Zeiten oder Zutaten. Bei Unsicherheit bleibt der bestmögliche Text stehen und ein kurzer deutscher Hinweis kommt in warnings.
 
 Regeln:
+- Kochbuchseiten sind häufig in zwei Spalten oder klar getrennte Textblöcke gesetzt. Lies niemals quer über Spaltengrenzen und vermische keine nebeneinanderstehenden Zeilen.
+- Die vom Nutzer als ZUTATENBEREICH und ZUBEREITUNGSBEREICH bezeichneten Ausschnitte sind die wichtigste Zuordnung. Auch wenn eine Überschrift fehlt, behandle ihren Inhalt entsprechend dieser Bezeichnung.
+- Ein Zutatenblock beginnt oft mit Angaben wie "Für 2/4/6 Personen" und enthält kurze Einträge mit Mengen oder Einheiten wie g, kg, ml, l, TL, EL, Bund, Dose oder Stück. Die Zutaten enden mit dem letzten solchen Eintrag; angrenzender Fließtext gehört nicht automatisch dazu.
+- Ein Zubereitungsblock enthält meist vollständige deutsche Sätze und häufig nummerierte Abschnitte wie "1.", "2." und "3.". Erhalte deren logische Reihenfolge, auch wenn der Text über mehrere Spalten oder Seiten läuft.
+- Beschreibender Fließtext oberhalb oder neben Zutaten und Zubereitung ist in der Regel Buchtext und kein Rezeptinhalt. Übernimm ihn nur, wenn er eine konkrete Servier-, Vorbereitungs- oder Aufbewahrungsinformation enthält.
 - Ignoriere Seitenzahlen, laufende Kopfzeilen, dekorative Texte, Bildunterschriften und allgemeine Einleitungstexte, sofern sie keine wichtige Servier-, Aufbewahrungs- oder Vorbereitungsaussage enthalten.
 - ingredients enthält jede Zutat genau einmal, mit Menge, Einheit und Zubereitungshinweis.
 - Sortiere Zutaten ohne Zwischenüberschriften in dieser Reihenfolge: (1) Gemüse/Obst, (2) Fleisch/Fisch/Protein, (3) Milch-/Joghurtprodukte, (4) Sonstiges, (5) typische Vorräte wie Öl, Salz und Pfeffer. Behalte innerhalb einer Gruppe die Quellreihenfolge bei.
@@ -131,7 +136,7 @@ function parseModelJson(text) {
   return JSON.parse(cleaned);
 }
 
-export default {
+const worker = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
@@ -280,4 +285,6 @@ export default {
     }
   },
 };
+
+export default worker;
 
