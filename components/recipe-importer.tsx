@@ -796,24 +796,25 @@ export function RecipeImporter() {
 
   function buildDraft(group: { number: number; images: BatchImage[] }, parsed?: ParsedRecipe): Draft {
     const isSample = group.images.some((image) => image.id === "sample-text");
+    const useSampleDefaults = isSample && !parsed;
     const firstTextName = group.images[0]?.name ?? `Recipe ${group.number}`;
     return {
       id: crypto.randomUUID(),
       group: group.number,
-      title: isSample ? "Linsen-Auberginen-Eintopf" : parsed?.title || stripExtension(firstTextName),
+      title: useSampleDefaults ? "Linsen-Auberginen-Eintopf" : parsed?.title || stripExtension(firstTextName),
       courses: [],
       difficulty: "",
-      ingredients: isSample ? sampleIngredients : parsed?.ingredients || "[Review and add the extracted ingredients]",
-      steps: isSample ? sampleSteps : parsed?.steps || "[Review and add the preparation steps]",
-      cookingTime: isSample ? "Gesamtzeit: ca. 1 Std." : parsed?.cookingTime || "",
-      servings: isSample ? "2" : parsed?.servings || "",
-      comment: isSample
+      ingredients: useSampleDefaults ? sampleIngredients : parsed?.ingredients || "[Review and add the extracted ingredients]",
+      steps: useSampleDefaults ? sampleSteps : parsed?.steps || "[Review and add the preparation steps]",
+      cookingTime: useSampleDefaults ? "Gesamtzeit: ca. 1 Std." : parsed?.cookingTime || "",
+      servings: useSampleDefaults ? "2" : parsed?.servings || "",
+      comment: useSampleDefaults
         ? "Für 4 Personen als Vorspeise oder Beilage, für 2 Personen als Hauptgericht."
         : parsed?.comment || "",
       link: "",
       visited: false,
       deleted: false,
-      warning: isSample ? undefined : parsed?.warning,
+      warning: useSampleDefaults ? "Offline sample shown; Qwen was not contacted." : parsed?.warning,
     };
   }
 
@@ -827,7 +828,7 @@ export function RecipeImporter() {
       group.images.some((image) => image.id === "sample-text" && !image.ocrRegions),
     );
 
-    if (sampleOnly) {
+    if (sampleOnly && !navigator.onLine) {
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       nextDrafts = groups.map((group) => buildDraft(group));
       setProcessingProgress(1);
