@@ -6,6 +6,7 @@ preview_urls = false
 
 [vars]
 OPENROUTER_MODEL = "qwen/qwen3.5-flash-02-23"
+NOTION_DATA_SOURCE_ID = "3579e71b-2d0b-835f-b91c-07fe638b7109"
 
 [observability]
 enabled = true

@@ -1,5 +1,7 @@
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_MODEL = "qwen/qwen3.5-flash-02-23";
+const NOTION_API = "https://api.notion.com/v1";
+const NOTION_VERSION = "2026-03-11";
 const MAX_REQUEST_BYTES = 18 * 1024 * 1024;
 const MAX_IMAGES = 10;
 
@@ -136,6 +138,165 @@ function parseModelJson(text) {
   return JSON.parse(cleaned);
 }
 
+function notionHeaders(token, jsonContent = true) {
+  return {
+    Authorization: `Bearer ${token}`,
+    "Notion-Version": NOTION_VERSION,
+    ...(jsonContent ? { "Content-Type": "application/json" } : {}),
+  };
+}
+
+function richText(value, annotations) {
+  const text = String(value || "").trim();
+  if (!text) return [];
+  const chunks = text.match(/[\s\S]{1,1900}/g) || [];
+  return chunks.map((content) => ({
+    type: "text",
+    text: { content },
+    ...(annotations ? { annotations } : {}),
+  }));
+}
+
+function parseStepPhases(value) {
+  const lines = String(value || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const phases = [];
+  let current = { name: "Zubereitung", steps: [] };
+
+  for (const line of lines) {
+    const numbered = line.match(/^\d+\s*[.)]\s*(.+)$/);
+    if (numbered) {
+      current.steps.push(numbered[1].trim());
+      continue;
+    }
+    if (current.steps.length) {
+      phases.push(current);
+      current = { name: line, steps: [] };
+    } else if (current.name === "Zubereitung") {
+      current.name = line;
+    } else {
+      current.steps.push(line);
+    }
+  }
+  if (current.steps.length) phases.push(current);
+  return phases.length ? phases : [{ name: "Zubereitung", steps: [String(value || "").trim()] }];
+}
+
+function decodeImageDataUrl(dataUrl) {
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,([a-z0-9+/=\r\n]+)$/i.exec(dataUrl || "");
+  if (!match) throw new Error("The finished-dish image is invalid.");
+  const bytes = Uint8Array.from(atob(match[2].replace(/\s/g, "")), (character) => character.charCodeAt(0));
+  const extension = match[1] === "image/png" ? "png" : match[1] === "image/webp" ? "webp" : "jpg";
+  return { blob: new Blob([bytes], { type: match[1] }), contentType: match[1], extension };
+}
+
+async function notionJson(path, token, init = {}) {
+  const response = await fetch(`${NOTION_API}${path}`, {
+    ...init,
+    headers: { ...notionHeaders(token), ...(init.headers || {}) },
+  });
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.message || `Notion returned HTTP ${response.status}.`);
+  }
+  return payload;
+}
+
+async function uploadImageToNotion(dataUrl, title, token) {
+  if (!dataUrl) return null;
+  const { blob, contentType, extension } = decodeImageDataUrl(dataUrl);
+  const safeTitle = String(title || "recipe").replace(/[^a-z0-9äöüß_-]+/gi, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "recipe";
+  const filename = `${safeTitle}.${extension}`;
+  const upload = await notionJson("/file_uploads", token, {
+    method: "POST",
+    body: JSON.stringify({ mode: "single_part", filename, content_type: contentType }),
+  });
+  const form = new FormData();
+  form.append("file", blob, filename);
+  const sent = await fetch(`${NOTION_API}/file_uploads/${upload.id}/send`, {
+    method: "POST",
+    headers: notionHeaders(token, false),
+    body: form,
+  });
+  let sentPayload;
+  try {
+    sentPayload = await sent.json();
+  } catch {
+    sentPayload = null;
+  }
+  if (!sent.ok) throw new Error(sentPayload?.message || `Notion image upload returned HTTP ${sent.status}.`);
+  return upload.id;
+}
+
+function buildNotionChildren(recipe, imageUploadId) {
+  const children = [];
+  if (imageUploadId) {
+    children.push({
+      object: "block",
+      type: "image",
+      image: { type: "file_upload", file_upload: { id: imageUploadId } },
+    });
+  }
+  children.push({ object: "block", type: "paragraph", paragraph: { rich_text: [] } });
+  for (const phase of parseStepPhases(recipe.steps)) {
+    children.push({
+      object: "block",
+      type: "callout",
+      callout: {
+        rich_text: richText(phase.name, { bold: true, italic: false, strikethrough: false, underline: false, code: false, color: "default" }),
+        icon: { type: "external", external: { url: "https://www.notion.so/icons/knife-kitchen_gray.svg" } },
+        color: "gray_background",
+        children: phase.steps.filter(Boolean).map((step) => ({
+          object: "block",
+          type: "numbered_list_item",
+          numbered_list_item: { rich_text: richText(step), color: "default" },
+        })),
+      },
+    });
+  }
+  return children;
+}
+
+async function importRecipeToNotion(recipe, env) {
+  const title = String(recipe?.title || "").trim();
+  const difficulty = recipe?.difficulty;
+  const courses = Array.isArray(recipe?.courses) ? recipe.courses.filter(Boolean) : [];
+  if (!title || !recipe?.ingredients || !recipe?.steps || !courses.length || !["Daily", "Special"].includes(difficulty)) {
+    throw new Error("The recipe is missing required review fields.");
+  }
+  const imageUploadId = await uploadImageToNotion(recipe.imageDataUrl, title, env.NOTION_TOKEN);
+  const servings = Number.parseFloat(String(recipe.servings || "").replace(",", "."));
+  const properties = {
+    Name: { title: richText(title) },
+    Course: { multi_select: courses.map((name) => ({ name })) },
+    Difficulty: { select: { name: difficulty } },
+    Ingredients: { rich_text: richText(recipe.ingredients) },
+  };
+  if (recipe.cookingTime?.trim()) properties["Cooking Time"] = { rich_text: richText(recipe.cookingTime) };
+  if (Number.isFinite(servings)) properties.Servings = { number: servings };
+  if (recipe.comment?.trim()) properties.Comment = { rich_text: richText(recipe.comment) };
+  if (recipe.link?.trim()) properties.Link = { url: recipe.link.trim() };
+
+  const page = await notionJson("/pages", env.NOTION_TOKEN, {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: env.NOTION_DATA_SOURCE_ID },
+      icon: { type: "external", external: { url: "https://www.notion.so/icons/dining_gray.svg" } },
+      properties,
+      children: buildNotionChildren(recipe, imageUploadId),
+    }),
+  });
+  return { id: page.id, url: page.url, title };
+}
+
 const worker = {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -158,7 +319,40 @@ const worker = {
       );
     }
 
-    if (request.method !== "POST" || url.pathname !== "/v1/extract-recipe") {
+    if (request.method === "GET" && url.pathname === "/v1/notion-status") {
+      if (origin && !ALLOWED_ORIGINS.has(origin)) {
+        return json({ error: "Origin not allowed." }, 403, origin);
+      }
+      if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID) {
+        return json({ error: "Notion is not configured on the server yet." }, 503, origin);
+      }
+      try {
+        const dataSource = await notionJson(`/data_sources/${env.NOTION_DATA_SOURCE_ID}`, env.NOTION_TOKEN, {
+          method: "GET",
+        });
+        return json(
+          {
+            ok: true,
+            dataSourceId: dataSource.id,
+            title: Array.isArray(dataSource.title)
+              ? dataSource.title.map((item) => item?.plain_text || "").join("")
+              : "",
+          },
+          200,
+          origin,
+        );
+      } catch (error) {
+        return json(
+          { error: error instanceof Error ? error.message : "Notion access could not be verified." },
+          502,
+          origin,
+        );
+      }
+    }
+
+    const isExtractRequest = request.method === "POST" && url.pathname === "/v1/extract-recipe";
+    const isNotionImportRequest = request.method === "POST" && url.pathname === "/v1/import-notion";
+    if (!isExtractRequest && !isNotionImportRequest) {
       return json({ error: "Not found." }, 404, origin);
     }
 
@@ -166,8 +360,11 @@ const worker = {
       return json({ error: "Origin not allowed." }, 403, origin);
     }
 
-    if (!env.OPENROUTER_API_KEY) {
+    if (isExtractRequest && !env.OPENROUTER_API_KEY) {
       return json({ error: "OPENROUTER_API_KEY is not configured." }, 500, origin);
+    }
+    if (isNotionImportRequest && (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)) {
+      return json({ error: "Notion is not configured on the server yet." }, 503, origin);
     }
 
     const contentLength = Number(request.headers.get("Content-Length") || 0);
@@ -184,6 +381,19 @@ const worker = {
       body = JSON.parse(raw);
     } catch {
       return json({ error: "Request body must be valid JSON." }, 400, origin);
+    }
+
+    if (isNotionImportRequest) {
+      try {
+        const result = await importRecipeToNotion(body.recipe, env);
+        return json({ page: result }, 201, origin);
+      } catch (error) {
+        return json(
+          { error: error instanceof Error ? error.message : "The recipe could not be imported into Notion." },
+          502,
+          origin,
+        );
+      }
     }
 
     let titleImages;

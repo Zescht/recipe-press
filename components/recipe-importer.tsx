@@ -70,6 +70,7 @@ type PersistedState = {
 const STORAGE_KEY = "recipe-press:batch:v1";
 const PUBLIC_BASE = import.meta.env.BASE_URL || "/";
 const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/extract-recipe";
+const NOTION_IMPORT_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/import-notion";
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
@@ -164,6 +165,12 @@ type QwenRecipe = {
   ingredients: string[];
   phases: { name: string; steps: string[] }[];
   warnings: string[];
+};
+
+type NotionResult = {
+  draftId: string;
+  title: string;
+  url: string;
 };
 
 function ingredientRank(line: string) {
@@ -576,6 +583,8 @@ export function RecipeImporter() {
   const [submitError, setSubmitError] = useState("");
   const [processingMessage, setProcessingMessage] = useState("Connecting securely to Qwen…");
   const [processingProgress, setProcessingProgress] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -996,7 +1005,7 @@ export function RecipeImporter() {
     setUndoDraft(null);
   }
 
-  function submitBatch() {
+  async function submitBatch() {
     setDrafts((current) => current.map((draft) => (draft.deleted ? draft : { ...draft, visited: true })));
     const firstInvalid = drafts.findIndex((draft) => !draft.deleted && !draftIsComplete(draft));
     if (firstInvalid >= 0) {
@@ -1005,7 +1014,45 @@ export function RecipeImporter() {
       return;
     }
     setSubmitError("");
-    setFlow("results");
+    setIsSubmitting(true);
+    try {
+      const imported = [...notionResults];
+      for (const draft of remainingDrafts) {
+        if (imported.some((result) => result.draftId === draft.id)) continue;
+        const group = groups.find((item) => item.number === draft.group);
+        const dishImage = [...(group?.images || [])].reverse().find((image) => !image.ocrRegions);
+        const imageDataUrl = dishImage ? await prepareFullImageForAi(dishImage.url) : undefined;
+        const response = await fetch(NOTION_IMPORT_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            recipe: {
+              title: draft.title,
+              courses: draft.courses,
+              difficulty: draft.difficulty,
+              ingredients: draft.ingredients,
+              steps: draft.steps,
+              cookingTime: draft.cookingTime,
+              servings: draft.servings,
+              comment: draft.comment,
+              link: draft.link,
+              imageDataUrl,
+            },
+          }),
+        });
+        const payload = await response.json() as { page?: { title: string; url: string }; error?: string };
+        if (!response.ok || !payload.page) {
+          throw new Error(payload.error || `Notion could not import ${draft.title}.`);
+        }
+        imported.push({ draftId: draft.id, title: payload.page.title, url: payload.page.url });
+        setNotionResults([...imported]);
+      }
+      setFlow("results");
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : "The batch could not be imported into Notion.");
+    } finally {
+      setIsSubmitting(false);
+    }
   }
 
   async function startNewBatch() {
@@ -1018,6 +1065,7 @@ export function RecipeImporter() {
     setDrafts([]);
     setImageIndex(0);
     setDraftIndex(0);
+    setNotionResults([]);
     setFlow("upload");
   }
 
@@ -1327,8 +1375,8 @@ export function RecipeImporter() {
           <div className="review-actions">
             <button className="button button--secondary" type="button" disabled={remainingDrafts.length < 2} onClick={() => navigateDraft(-1)}>Prev</button>
             <button className="button button--secondary" type="button" disabled={remainingDrafts.length < 2} onClick={() => navigateDraft(1)}>Next</button>
-            <button className="button button--primary button--submit" type="button" disabled={!canSubmit} onClick={submitBatch}>
-              Submit {canSubmit ? remainingDrafts.length : `${completedDrafts.length}/${remainingDrafts.length}`}
+            <button className="button button--primary button--submit" type="button" disabled={!canSubmit || isSubmitting} onClick={() => void submitBatch()}>
+              {isSubmitting ? <><LoaderCircle className="spin" size={18} /> Importing…</> : <>Submit {canSubmit ? remainingDrafts.length : `${completedDrafts.length}/${remainingDrafts.length}`}</>}
             </button>
           </div>
         </section>
@@ -1338,22 +1386,23 @@ export function RecipeImporter() {
         <section className="workspace results-view page-enter">
           <div className="result-seal"><Check size={34} /></div>
           <p className="eyebrow">Batch complete</p>
-          <h1>{remainingDrafts.length} recipe{remainingDrafts.length === 1 ? " is" : "s are"} ready for Notion</h1>
-          <p>This localhost version completed the full upload and review workflow. Notion is not connected to the website yet, so no library pages were created.</p>
+          <h1>{notionResults.length} recipe{notionResults.length === 1 ? " is" : "s are"} now in Notion</h1>
+          <p>The reviewed recipes were created in Recipe Book TEST. Open a recipe below to verify its properties, image, and preparation blocks.</p>
 
           <div className="result-list">
-            {remainingDrafts.map((draft) => (
-              <article key={draft.id}>
+            {notionResults.map((result) => {
+              const draft = drafts.find((item) => item.id === result.draftId);
+              return <article key={result.draftId}>
                 <span><CircleCheck size={18} /></span>
-                <div><h2>{draft.title}</h2><p>{draft.courses.join(" · ")} · {draft.difficulty}</p></div>
-                <strong>Ready</strong>
-              </article>
-            ))}
+                <div><h2>{result.title}</h2><p>{draft?.courses.join(" · ")} · {draft?.difficulty}</p></div>
+                <a href={result.url} target="_blank" rel="noreferrer">Open in Notion</a>
+              </article>;
+            })}
           </div>
 
           <div className="connection-note">
-            <Sparkles size={20} />
-            <div><strong>Next implementation step</strong><p>Connect the server-side OpenAI and Notion credentials to turn draft creation and Submit into live operations.</p></div>
+            <CircleCheck size={20} />
+            <div><strong>Imported successfully</strong><p>Finished-dish photos are stored in Notion and used as the first page block whenever an image was available.</p></div>
           </div>
 
           <button className="button button--primary button--large" type="button" onClick={() => void startNewBatch()}><RotateCcw size={18} /> Start another batch</button>
