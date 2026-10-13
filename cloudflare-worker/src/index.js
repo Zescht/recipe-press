@@ -22,8 +22,6 @@ const RECIPE_SCHEMA = {
     properties: {
       title: { type: "string" },
       servings: { type: "string" },
-      cookingTime: { type: "string" },
-      comment: { type: "string" },
       ingredients: {
         type: "array",
         items: { type: "string" },
@@ -51,8 +49,6 @@ const RECIPE_SCHEMA = {
     required: [
       "title",
       "servings",
-      "cookingTime",
-      "comment",
       "ingredients",
       "phases",
       "warnings",
@@ -75,8 +71,6 @@ Regeln:
 - Sortiere Zutaten ohne Zwischenüberschriften in dieser Reihenfolge: (1) Gemüse/Obst, (2) Fleisch/Fisch/Protein, (3) Milch-/Joghurtprodukte, (4) Sonstiges, (5) typische Vorräte wie Öl, Salz und Pfeffer. Behalte innerhalb einer Gruppe die Quellreihenfolge bei.
 - phases enthält die Zubereitung in sinnvollen Phasen. Jede Phase hat einen kurzen deutschen Namen und vollständige Arbeitsschritte. Bewahre Fakten, Reihenfolge, Temperaturen, Zeiten und Sichtmerkmale.
 - servings ist nur die Zahl, wenn eindeutig vorhanden, sonst eine leere Zeichenfolge.
-- cookingTime ist eine knappe Angabe wie "Gesamtzeit: ca. 1 Std.", jedoch nur wenn die Quelle eine Gesamtzeit nennt oder sie eindeutig aus ausdrücklich genannten Zeiten hervorgeht.
-- comment enthält nützliche Angaben zu Servierkontext, Vorbereitung oder Aufbewahrung; sonst leer.
 - Wenn kein Titel sicher sichtbar ist, title leer lassen und eine Warnung ergänzen.
 - Antworte ausschließlich im vorgegebenen JSON-Schema.`;
 
@@ -157,34 +151,6 @@ function richText(value, annotations) {
   }));
 }
 
-function parseStepPhases(value) {
-  const lines = String(value || "")
-    .replace(/\r/g, "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const phases = [];
-  let current = { name: "Zubereitung", steps: [] };
-
-  for (const line of lines) {
-    const numbered = line.match(/^\d+\s*[.)]\s*(.+)$/);
-    if (numbered) {
-      current.steps.push(numbered[1].trim());
-      continue;
-    }
-    if (current.steps.length) {
-      phases.push(current);
-      current = { name: line, steps: [] };
-    } else if (current.name === "Zubereitung") {
-      current.name = line;
-    } else {
-      current.steps.push(line);
-    }
-  }
-  if (current.steps.length) phases.push(current);
-  return phases.length ? phases : [{ name: "Zubereitung", steps: [String(value || "").trim()] }];
-}
-
 function decodeImageDataUrl(dataUrl) {
   const match = /^data:(image\/(?:jpeg|png|webp));base64,([a-z0-9+/=\r\n]+)$/i.exec(dataUrl || "");
   if (!match) throw new Error("The finished-dish image is invalid.");
@@ -245,23 +211,6 @@ function buildNotionChildren(recipe, imageUploadId) {
       image: { type: "file_upload", file_upload: { id: imageUploadId } },
     });
   }
-  children.push({ object: "block", type: "paragraph", paragraph: { rich_text: [] } });
-  for (const phase of parseStepPhases(recipe.steps)) {
-    children.push({
-      object: "block",
-      type: "callout",
-      callout: {
-        rich_text: richText(phase.name, { bold: true, italic: false, strikethrough: false, underline: false, code: false, color: "default" }),
-        icon: { type: "external", external: { url: "https://www.notion.so/icons/knife-kitchen_gray.svg" } },
-        color: "gray_background",
-        children: phase.steps.filter(Boolean).map((step) => ({
-          object: "block",
-          type: "numbered_list_item",
-          numbered_list_item: { rich_text: richText(step), color: "default" },
-        })),
-      },
-    });
-  }
   return children;
 }
 
@@ -279,11 +228,9 @@ async function importRecipeToNotion(recipe, env) {
     Course: { multi_select: courses.map((name) => ({ name })) },
     Difficulty: { select: { name: difficulty } },
     Ingredients: { rich_text: richText(recipe.ingredients) },
+    Steps: { rich_text: richText(recipe.steps) },
   };
-  if (recipe.cookingTime?.trim()) properties["Cooking Time"] = { rich_text: richText(recipe.cookingTime) };
   if (Number.isFinite(servings)) properties.Servings = { number: servings };
-  if (recipe.comment?.trim()) properties.Comment = { rich_text: richText(recipe.comment) };
-  if (recipe.link?.trim()) properties.Link = { url: recipe.link.trim() };
 
   const page = await notionJson("/pages", env.NOTION_TOKEN, {
     method: "POST",

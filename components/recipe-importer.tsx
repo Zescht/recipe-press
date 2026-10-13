@@ -2,7 +2,6 @@
 
 import {
   Check,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -51,12 +50,9 @@ type Draft = {
   title: string;
   courses: string[];
   difficulty: "" | "Daily" | "Special";
+  servings: string;
   ingredients: string;
   steps: string;
-  cookingTime: string;
-  servings: string;
-  comment: string;
-  link: string;
   visited: boolean;
   deleted: boolean;
   warning?: string;
@@ -229,17 +225,13 @@ type ParsedRecipe = {
   title: string;
   ingredients: string;
   steps: string;
-  cookingTime?: string;
   servings?: string;
-  comment?: string;
   warning?: string;
 };
 
 type QwenRecipe = {
   title: string;
   servings: string;
-  cookingTime: string;
-  comment: string;
   ingredients: string[];
   phases: { name: string; steps: string[] }[];
   warnings: string[];
@@ -505,9 +497,7 @@ function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string): ParsedReci
     title: recipe.title.trim() || fallbackTitle,
     ingredients: ingredients || "[Review and add the extracted ingredients]",
     steps: steps || "[Review and add the preparation steps]",
-    cookingTime: recipe.cookingTime?.trim() || "",
     servings: recipe.servings?.trim() || "",
-    comment: recipe.comment?.trim() || "",
     warning: recipe.warnings?.filter(Boolean).join(" ") || undefined,
   };
 }
@@ -708,7 +698,6 @@ export function RecipeImporter() {
   const [draftIndex, setDraftIndex] = useState(0);
   const [hydrated, setHydrated] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [undoDraft, setUndoDraft] = useState<string | null>(null);
   const [defineImageId, setDefineImageId] = useState<string | null>(null);
@@ -1040,14 +1029,9 @@ export function RecipeImporter() {
       title: useSampleDefaults ? "Linsen-Auberginen-Eintopf" : parsed?.title || stripExtension(firstTextName),
       courses: [],
       difficulty: "",
+      servings: useSampleDefaults ? "2" : parsed?.servings || "",
       ingredients: useSampleDefaults ? sampleIngredients : parsed?.ingredients || "[Review and add the extracted ingredients]",
       steps: useSampleDefaults ? sampleSteps : parsed?.steps || "[Review and add the preparation steps]",
-      cookingTime: useSampleDefaults ? "Gesamtzeit: ca. 1 Std." : parsed?.cookingTime || "",
-      servings: useSampleDefaults ? "2" : parsed?.servings || "",
-      comment: useSampleDefaults
-        ? "Für 4 Personen als Vorspeise oder Beilage, für 2 Personen als Hauptgericht."
-        : parsed?.comment || "",
-      link: "",
       visited: false,
       deleted: false,
       warning: useSampleDefaults ? "Offline sample shown; Qwen was not contacted." : parsed?.warning,
@@ -1257,12 +1241,9 @@ export function RecipeImporter() {
               title: draft.title,
               courses: draft.courses,
               difficulty: draft.difficulty,
+              servings: draft.servings,
               ingredients: draft.ingredients,
               steps: draft.steps,
-              cookingTime: draft.cookingTime,
-              servings: draft.servings,
-              comment: draft.comment,
-              link: draft.link,
               imageDataUrl,
             },
           }),
@@ -1595,28 +1576,19 @@ export function RecipeImporter() {
             </fieldset>
 
             <label className="field">
+              <span>Servings <em>Notion property</em></span>
+              <input inputMode="numeric" value={activeDraft.servings} onChange={(event) => updateDraft({ servings: event.target.value })} />
+            </label>
+
+            <label className="field">
               <span>Ingredients <em>Notion property</em></span>
               <textarea className="ingredients-editor" value={activeDraft.ingredients} onChange={(event) => updateDraft({ ingredients: event.target.value, warning: undefined })} />
             </label>
 
             <label className="field">
-              <span>Steps <em>Notion page body</em></span>
+              <span>Steps <em>Notion property</em></span>
               <textarea className="steps-editor" value={activeDraft.steps} onChange={(event) => updateDraft({ steps: event.target.value, warning: undefined })} />
             </label>
-
-            <div className="details-panel">
-              <button type="button" onClick={() => setDetailsOpen((open) => !open)} aria-expanded={detailsOpen}>
-                Additional details <ChevronDown className={detailsOpen ? "is-open" : ""} size={18} />
-              </button>
-              {detailsOpen ? (
-                <div className="details-grid">
-                  <label className="field"><span>Cooking time</span><input value={activeDraft.cookingTime} onChange={(event) => updateDraft({ cookingTime: event.target.value })} /></label>
-                  <label className="field"><span>Servings</span><input inputMode="numeric" value={activeDraft.servings} onChange={(event) => updateDraft({ servings: event.target.value })} /></label>
-                  <label className="field field--wide"><span>Comment</span><textarea value={activeDraft.comment} onChange={(event) => updateDraft({ comment: event.target.value })} /></label>
-                  <label className="field field--wide"><span>Source link</span><input inputMode="url" value={activeDraft.link} onChange={(event) => updateDraft({ link: event.target.value })} /></label>
-                </div>
-              ) : null}
-            </div>
           </div>
 
           <div className="recipe-dots" aria-label="Recipe review status">
@@ -1642,7 +1614,7 @@ export function RecipeImporter() {
           <div className="result-seal"><Check size={34} /></div>
           <p className="eyebrow">Batch complete</p>
           <h1>{notionResults.length} recipe{notionResults.length === 1 ? " is" : "s are"} now in Notion</h1>
-          <p>The reviewed recipes were created in Recipe Book TEST. Open a recipe below to verify its properties, image, and preparation blocks.</p>
+          <p>The reviewed recipes were created in Recipe Book TEST. Open a recipe below to verify its properties and finished-dish image.</p>
 
           <div className="result-list">
             {notionResults.map((result) => {
