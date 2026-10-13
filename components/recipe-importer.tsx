@@ -11,12 +11,15 @@ import {
   FileText,
   ImagePlus,
   LoaderCircle,
+  Maximize2,
   Plus,
   RotateCcw,
   Sparkles,
   Trash2,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -30,6 +33,7 @@ type FlowStep = "upload" | "assign" | "groups" | "processing" | "review" | "resu
 type CropPoint = { x: number; y: number };
 type CropQuad = [CropPoint, CropPoint, CropPoint, CropPoint];
 type OcrRegions = { ingredients: CropQuad; steps: CropQuad };
+type PreviewImage = { src: string; alt: string; name: string };
 
 type BatchImage = {
   id: string;
@@ -636,6 +640,65 @@ function RegionEditor({
   );
 }
 
+function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+  const [zoom, setZoom] = useState(1);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+      if (event.key === "+" || event.key === "=") setZoom((current) => Math.min(4, current + 0.5));
+      if (event.key === "-") setZoom((current) => Math.max(1, current - 0.5));
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="image-preview"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Preview ${image.name}`}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <header className="image-preview__header">
+        <div>
+          <p className="eyebrow">Image inspection</p>
+          <strong>{image.name}</strong>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close full-screen image preview"><X size={24} /></button>
+      </header>
+
+      <div className="image-preview__viewport">
+        <div
+          className="image-preview__stage"
+          style={{ width: `${zoom * 100}%`, height: `${zoom * 100}%` }}
+          onDoubleClick={() => setZoom((current) => current === 1 ? 2 : 1)}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={image.src} alt={image.alt} draggable={false} />
+        </div>
+      </div>
+
+      <footer className="image-preview__controls">
+        <button type="button" disabled={zoom <= 1} onClick={() => setZoom((current) => Math.max(1, current - 0.5))} aria-label="Zoom out"><ZoomOut size={20} /></button>
+        <button className="image-preview__zoom-value" type="button" disabled={zoom === 1} onClick={() => setZoom(1)} aria-label="Reset zoom to fit">
+          <Maximize2 size={17} /> {Math.round(zoom * 100)}%
+        </button>
+        <button type="button" disabled={zoom >= 4} onClick={() => setZoom((current) => Math.min(4, current + 0.5))} aria-label="Zoom in"><ZoomIn size={20} /></button>
+        <span>Use +/− or double-click to zoom. Scroll to inspect.</span>
+      </footer>
+    </div>
+  );
+}
+
 export function RecipeImporter() {
   const [batchId, setBatchId] = useState<string | null>(null);
   const [flow, setFlow] = useState<FlowStep>("upload");
@@ -655,6 +718,7 @@ export function RecipeImporter() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
   const [savedBatches, setSavedBatches] = useState<SavedBatchSummary[]>([]);
+  const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -1305,10 +1369,12 @@ export function RecipeImporter() {
             <div className="upload-strip" aria-label="Uploaded images">
               {images.map((image, index) => (
                 <figure className="upload-thumb" key={image.id}>
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={image.url} alt={`Uploaded image ${index + 1}`} />
+                  <button className="upload-thumb__preview" type="button" onClick={() => setPreviewImage({ src: image.url, alt: `Uploaded image ${index + 1}`, name: image.name })} aria-label={`Preview uploaded image ${index + 1} full screen`}>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={image.url} alt={`Uploaded image ${index + 1}`} />
+                  </button>
                   <figcaption>{index + 1}</figcaption>
-                  <button type="button" onClick={() => void removeImage(image)} aria-label={`Remove image ${index + 1}`}><X size={15} /></button>
+                  <button className="upload-thumb__remove" type="button" onClick={() => void removeImage(image)} aria-label={`Remove image ${index + 1}`}><X size={15} /></button>
                 </figure>
               ))}
             </div>
@@ -1368,8 +1434,11 @@ export function RecipeImporter() {
               <ChevronLeft />
             </button>
             <figure className={images[imageIndex].excluded ? "is-excluded" : ""}>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={images[imageIndex].url} alt={images[imageIndex].name} />
+              <button className="stage-preview-trigger" type="button" onClick={() => setPreviewImage({ src: images[imageIndex].url, alt: images[imageIndex].name, name: images[imageIndex].name })} aria-label={`Preview ${images[imageIndex].name} full screen`}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={images[imageIndex].url} alt={images[imageIndex].name} />
+                <span><Maximize2 size={17} /> Enlarge</span>
+              </button>
               {images[imageIndex].excluded ? <figcaption>Excluded</figcaption> : null}
             </figure>
             <button className="stage-arrow stage-arrow--right" type="button" onClick={() => setImageIndex((imageIndex + 1) % images.length)} aria-label="Next image">
@@ -1436,8 +1505,10 @@ export function RecipeImporter() {
                 <div className="group-thumbnails">
                   {group.images.map((image, index) => (
                     <div className="group-thumbnail" key={image.id}>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={image.url} alt={`${image.name}, position ${index + 1}`} />
+                      <button className="group-thumbnail__preview" type="button" onClick={() => setPreviewImage({ src: image.url, alt: `${image.name}, position ${index + 1}`, name: image.name })} aria-label={`Preview ${image.name} full screen`}>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={image.url} alt={`${image.name}, position ${index + 1}`} />
+                      </button>
                       <span>{index + 1}</span>
                       <div className="thumbnail-tools">
                         <button type="button" disabled={index === 0} onClick={() => moveWithinGroup(image.id, -1)} aria-label="Move image left"><ChevronLeft size={15} /></button>
@@ -1591,6 +1662,8 @@ export function RecipeImporter() {
       {defineImage ? (
         <RegionEditor image={defineImage} onCancel={() => setDefineImageId(null)} onSave={saveOcrRegions} />
       ) : null}
+
+      {previewImage ? <ImagePreview image={previewImage} onClose={() => setPreviewImage(null)} /> : null}
 
       {deleteTarget ? (
         <div className="dialog-backdrop" role="presentation" onMouseDown={() => setDeleteTarget(null)}>
