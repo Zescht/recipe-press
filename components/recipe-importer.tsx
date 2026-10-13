@@ -1570,11 +1570,15 @@ export function RecipeImporter() {
             <fieldset className="field-group">
               <legend>Course <em>Choose one or more</em></legend>
               <div className="choice-grid">
-                {courseOptions.map((course) => (
-                  <button type="button" className={activeDraft.courses.includes(course) ? "is-selected" : ""} key={course} onClick={() => toggleCourse(course)} aria-pressed={activeDraft.courses.includes(course)}>
-                    {activeDraft.courses.includes(course) ? <Check size={15} /> : null}{course}
-                  </button>
-                ))}
+                {courseOptions.map((course) => {
+                  const selected = activeDraft.courses.includes(course);
+                  return (
+                    <button type="button" className={selected ? "is-selected" : ""} key={course} onClick={() => toggleCourse(course)} aria-pressed={selected}>
+                      <span className="choice-marker" aria-hidden="true">{selected ? <Check size={15} /> : null}</span>
+                      <span>{course}</span>
+                    </button>
+                  );
+                })}
               </div>
             </fieldset>
 
@@ -1583,7 +1587,8 @@ export function RecipeImporter() {
               <div className="segmented-control">
                 {(["Daily", "Special"] as const).map((difficulty) => (
                   <button type="button" key={difficulty} className={activeDraft.difficulty === difficulty ? "is-selected" : ""} onClick={() => updateDraft({ difficulty })} aria-pressed={activeDraft.difficulty === difficulty}>
-                    {difficulty}
+                    <span className="choice-marker" aria-hidden="true">{activeDraft.difficulty === difficulty ? <Check size={15} /> : null}</span>
+                    <span>{difficulty}</span>
                   </button>
                 ))}
               </div>

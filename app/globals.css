@@ -230,6 +230,7 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .review-form { display:grid; gap:26px; }
 .field,.field-group { display:grid; gap:9px; }
 .field>span,.field-group>legend { color:var(--muted); font-family:var(--mono); font-size:.7rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
+.field>span em,.field-group>legend em { margin-left:5px; color:var(--muted); font-style:normal; font-weight:500; }
 .field input,.field textarea { width:100%; border:1px solid var(--ink); border-radius:0; background:var(--paper-bright); transition:box-shadow .14s ease; }
 .field input:focus,.field textarea:focus { box-shadow:6px 6px 0 var(--acid); outline:none; }
 .field input { min-height:50px; padding:0 14px; }
@@ -238,9 +239,13 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .field--title input:focus { box-shadow:none; }
 .field-group { min-width:0; margin:0; padding:0; border:0; }
 .choice-grid,.segmented-control { display:flex; flex-wrap:wrap; gap:7px; }
-.choice-grid button,.segmented-control button { min-height:44px; padding:0 14px; border:1px solid var(--ink); border-radius:0; background:transparent; font-family:var(--mono); font-size:.72rem; font-weight:600; cursor:pointer; }
-.choice-grid button:hover,.segmented-control button:hover { background:var(--ink); color:#fff; }
-.choice-grid button.is-active,.segmented-control button.is-active { background:var(--acid); color:var(--ink); }
+.choice-grid button,.segmented-control button { min-height:44px; padding:0 14px; border:1px solid var(--ink); border-radius:0; display:inline-flex; align-items:center; justify-content:center; gap:8px; background:transparent; font-family:var(--mono); font-size:.72rem; font-weight:600; line-height:1.2; cursor:pointer; }
+.choice-marker { width:16px; height:16px; flex:0 0 16px; display:grid; place-items:center; }
+.choice-grid button.is-selected,.segmented-control button.is-selected { background:var(--ink); color:#fff; }
+.choice-grid button.is-selected .choice-marker,.segmented-control button.is-selected .choice-marker { color:var(--acid); }
+@media (hover:hover) {
+  .choice-grid button:not(.is-selected):hover,.segmented-control button:not(.is-selected):hover { background:var(--ink); color:#fff; }
+}
 .ingredients-editor,.steps-editor { display:grid; gap:11px; }
 .ingredients-editor h3,.steps-editor h3 { margin:0; font-size:2rem; }
 .ingredients-editor>p,.steps-editor>p { margin:-5px 0 2px; color:var(--muted); font-family:var(--mono); font-size:.72rem; }
