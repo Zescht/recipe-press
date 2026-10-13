@@ -92,6 +92,20 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .upload-thumb img,.group-thumbnail img { width:100%; height:100%; object-fit:cover; }
 .upload-thumb figcaption { position:absolute; left:0; bottom:0; min-width:30px; padding:5px 8px; background:var(--acid); font-family:var(--mono); font-size:.7rem; font-weight:700; }
 .upload-thumb button { position:absolute; top:6px; right:6px; width:30px; height:30px; padding:0; border:1px solid rgba(255,255,255,.5); display:grid; place-items:center; background:var(--ink); color:#fff; cursor:pointer; }
+.saved-batches { margin-top:28px; border-top:1px solid var(--ink); }
+.saved-batches__heading { padding:22px 0 14px; display:flex; align-items:flex-end; justify-content:space-between; gap:20px; }
+.saved-batches__heading .eyebrow { margin-bottom:6px; }
+.saved-batches__heading h2 { margin:0; font-size:clamp(2rem,3.5vw,3rem); line-height:1; }
+.saved-batches__heading>span { min-width:38px; height:30px; padding:0 9px; display:grid; place-items:center; background:var(--ink); color:var(--acid); font-family:var(--mono); font-size:.72rem; }
+.saved-batches__list { border-bottom:1px solid var(--ink); }
+.saved-batches__list>button { width:100%; min-height:76px; padding:13px 0; border:0; border-top:1px solid var(--line); display:flex; align-items:center; gap:14px; background:transparent; text-align:left; cursor:pointer; }
+.saved-batches__list>button:first-child { border-top:0; }
+.saved-batches__list>button:hover { background:var(--paper-bright); }
+.saved-batches__list>button>svg { flex:0 0 auto; margin-left:auto; }
+.saved-batches__icon { width:42px; height:42px; flex:0 0 auto; display:grid; place-items:center; background:var(--acid); color:var(--ink); }
+.saved-batches__copy { min-width:0; display:grid; gap:4px; }
+.saved-batches__copy strong { overflow:hidden; color:var(--ink); font-family:var(--serif); font-size:1.2rem; font-weight:400; text-overflow:ellipsis; white-space:nowrap; }
+.saved-batches__copy small { color:var(--muted); font-family:var(--mono); font-size:.67rem; text-transform:uppercase; }
 .view-footer { margin-top:24px; justify-content:space-between; }
 .view-footer>p { margin:0; color:var(--muted); font-family:var(--mono); font-size:.72rem; letter-spacing:.02em; }
 

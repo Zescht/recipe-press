@@ -20,7 +20,6 @@ import {
 } from "lucide-react";
 import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  clearImageBlobs,
   deleteImageBlob,
   loadImageBlob,
   saveImageBlob,
@@ -59,21 +58,96 @@ type Draft = {
   warning?: string;
 };
 
+type NotionResult = {
+  draftId: string;
+  title: string;
+  url: string;
+};
+
 type PersistedState = {
   flow: FlowStep;
   images: Omit<BatchImage, "url">[];
   drafts: Draft[];
   imageIndex: number;
   draftIndex: number;
+  notionResults?: NotionResult[];
 };
 
-const STORAGE_KEY = "recipe-press:batch:v1";
+type SavedBatchSummary = {
+  id: string;
+  title: string;
+  flow: FlowStep;
+  updatedAt: string;
+  imageCount: number;
+  recipeCount: number;
+  importedCount: number;
+};
+
+const LEGACY_STORAGE_KEY = "recipe-press:batch:v1";
+const BATCH_STORAGE_PREFIX = "recipe-press:batch:v2:";
+const BATCH_INDEX_KEY = "recipe-press:batches:v2";
 const PUBLIC_BASE = import.meta.env.BASE_URL || "/";
 const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/extract-recipe";
 const NOTION_IMPORT_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/import-notion";
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
+}
+
+const flowSteps: FlowStep[] = ["upload", "assign", "groups", "processing", "review", "results"];
+
+function batchStorageKey(id: string) {
+  return `${BATCH_STORAGE_PREFIX}${id}`;
+}
+
+function batchUrl(id: string, flow: FlowStep) {
+  return `${publicAsset("")}#/batch/${encodeURIComponent(id)}/${flow}`;
+}
+
+function parseBatchRoute() {
+  if (typeof window === "undefined") return null;
+  const match = window.location.hash.match(/^#\/batch\/([^/]+)\/([^/]+)$/);
+  if (!match || !flowSteps.includes(match[2] as FlowStep)) return null;
+  return { id: decodeURIComponent(match[1]), flow: match[2] as FlowStep };
+}
+
+function readBatchIndex(): SavedBatchSummary[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(BATCH_INDEX_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeBatchIndex(entries: SavedBatchSummary[]) {
+  localStorage.setItem(BATCH_INDEX_KEY, JSON.stringify(entries));
+}
+
+function summarizeBatch(id: string, state: PersistedState, updatedAt = new Date().toISOString()): SavedBatchSummary {
+  const activeDrafts = (state.drafts || []).filter((draft) => !draft.deleted);
+  return {
+    id,
+    title: activeDrafts[0]?.title?.trim() || `Photo batch · ${state.images.length} image${state.images.length === 1 ? "" : "s"}`,
+    flow: state.flow,
+    updatedAt,
+    imageCount: state.images.length,
+    recipeCount: activeDrafts.length,
+    importedCount: state.notionResults?.length || 0,
+  };
+}
+
+function formatSavedBatchDate(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function savedBatchLabel(batch: SavedBatchSummary) {
+  if (batch.importedCount) return `${batch.importedCount} imported`;
+  if (batch.recipeCount) return `${batch.recipeCount} draft${batch.recipeCount === 1 ? "" : "s"}`;
+  return `${batch.imageCount} image${batch.imageCount === 1 ? "" : "s"}`;
 }
 
 const sampleRecipePath = publicAsset("samples/recipe-text.jpeg");
@@ -165,12 +239,6 @@ type QwenRecipe = {
   ingredients: string[];
   phases: { name: string; steps: string[] }[];
   warnings: string[];
-};
-
-type NotionResult = {
-  draftId: string;
-  title: string;
-  url: string;
 };
 
 function ingredientRank(line: string) {
@@ -569,6 +637,7 @@ function RegionEditor({
 }
 
 export function RecipeImporter() {
+  const [batchId, setBatchId] = useState<string | null>(null);
   const [flow, setFlow] = useState<FlowStep>("upload");
   const [images, setImages] = useState<BatchImage[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -585,14 +654,38 @@ export function RecipeImporter() {
   const [processingProgress, setProcessingProgress] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
+  const [savedBatches, setSavedBatches] = useState<SavedBatchSummary[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function restore() {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      let index = readBatchIndex();
+      const legacyRaw = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (legacyRaw) {
+        try {
+          const legacyState = JSON.parse(legacyRaw) as PersistedState;
+          const legacyId = crypto.randomUUID();
+          localStorage.setItem(batchStorageKey(legacyId), JSON.stringify({ ...legacyState, notionResults: [] }));
+          index = [summarizeBatch(legacyId, legacyState), ...index];
+          writeBatchIndex(index);
+        } catch {
+          // Ignore invalid legacy state while keeping all newer saved sessions intact.
+        }
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      }
+      setSavedBatches(index);
+
+      const route = parseBatchRoute();
+      if (!route) {
+        setHydrated(true);
+        return;
+      }
+
+      const raw = localStorage.getItem(batchStorageKey(route.id));
       if (!raw) {
+        window.history.replaceState({}, "", publicAsset(""));
         setHydrated(true);
         return;
       }
@@ -609,13 +702,19 @@ export function RecipeImporter() {
 
         if (cancelled) return;
         const available = restored.filter((image): image is BatchImage => Boolean(image));
+        setBatchId(route.id);
         setImages(available);
         setDrafts(saved.drafts ?? []);
+        setNotionResults(saved.notionResults ?? []);
         setImageIndex(Math.min(saved.imageIndex ?? 0, Math.max(available.length - 1, 0)));
         setDraftIndex(Math.min(saved.draftIndex ?? 0, Math.max((saved.drafts?.length ?? 1) - 1, 0)));
-        setFlow(saved.flow === "processing" ? "groups" : saved.flow);
+        const restoredFlow = route.flow === "processing" ? "groups" : route.flow;
+        setFlow(restoredFlow);
+        if (restoredFlow !== route.flow) {
+          window.history.replaceState({}, "", batchUrl(route.id, restoredFlow));
+        }
       } catch {
-        localStorage.removeItem(STORAGE_KEY);
+        window.history.replaceState({}, "", publicAsset(""));
       } finally {
         if (!cancelled) setHydrated(true);
       }
@@ -628,7 +727,7 @@ export function RecipeImporter() {
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || !batchId) return;
     const state: PersistedState = {
       flow,
       images: images.map((image) => ({
@@ -642,9 +741,32 @@ export function RecipeImporter() {
       drafts,
       imageIndex,
       draftIndex,
+      notionResults,
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [draftIndex, drafts, flow, hydrated, imageIndex, images]);
+    localStorage.setItem(batchStorageKey(batchId), JSON.stringify(state));
+    const nextSummary = summarizeBatch(batchId, state);
+    const nextIndex = [nextSummary, ...readBatchIndex().filter((entry) => entry.id !== batchId)]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    writeBatchIndex(nextIndex);
+  }, [batchId, draftIndex, drafts, flow, hydrated, imageIndex, images, notionResults]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    function handleHistoryNavigation() {
+      const route = parseBatchRoute();
+      if (!route) {
+        window.location.reload();
+        return;
+      }
+      if (route.id !== batchId) {
+        window.location.reload();
+        return;
+      }
+      setFlow(route.flow === "processing" ? "groups" : route.flow);
+    }
+    window.addEventListener("popstate", handleHistoryNavigation);
+    return () => window.removeEventListener("popstate", handleHistoryNavigation);
+  }, [batchId, hydrated]);
 
   const assignedGroups = useMemo(
     () => [...new Set(images.filter((image) => !image.excluded && image.group).map((image) => image.group!))].sort((a, b) => a - b),
@@ -668,8 +790,46 @@ export function RecipeImporter() {
   const canSubmit = remainingDrafts.length > 0 && completedDrafts.length === remainingDrafts.length;
   const defineImage = images.find((image) => image.id === defineImageId);
 
+  function ensureBatch(nextFlow: FlowStep = flow) {
+    if (batchId) return batchId;
+    const nextId = crypto.randomUUID();
+    setBatchId(nextId);
+    window.history.pushState({}, "", batchUrl(nextId, nextFlow));
+    return nextId;
+  }
+
+  function goToFlow(nextFlow: FlowStep, replace = false) {
+    const activeBatchId = ensureBatch(nextFlow);
+    setFlow(nextFlow);
+    const nextUrl = batchUrl(activeBatchId, nextFlow);
+    if (`${window.location.pathname}${window.location.hash}` === nextUrl) return;
+    window.history[replace ? "replaceState" : "pushState"]({}, "", nextUrl);
+  }
+
+  function openFreshStart() {
+    images.forEach((image) => {
+      if (!image.samplePath) URL.revokeObjectURL(image.url);
+    });
+    setBatchId(null);
+    setImages([]);
+    setDrafts([]);
+    setImageIndex(0);
+    setDraftIndex(0);
+    setNotionResults([]);
+    setSubmitError("");
+    setFlow("upload");
+    setSavedBatches(readBatchIndex());
+    window.history.pushState({}, "", publicAsset(""));
+  }
+
+  function openSavedBatch(savedBatch: SavedBatchSummary) {
+    window.location.assign(batchUrl(savedBatch.id, savedBatch.flow === "processing" ? "groups" : savedBatch.flow));
+  }
+
   async function addFiles(files: File[]) {
     const accepted = files.filter((file) => file.type.startsWith("image/"));
+    if (!accepted.length) return;
+    ensureBatch("upload");
     const additions = accepted.map((file) => ({
       id: crypto.randomUUID(),
       name: file.name,
@@ -698,6 +858,8 @@ export function RecipeImporter() {
   }
 
   function loadSample() {
+    const hadBatch = Boolean(batchId);
+    const activeBatchId = ensureBatch("assign");
     setImages([
       {
         id: "sample-text",
@@ -719,6 +881,7 @@ export function RecipeImporter() {
     setDrafts([]);
     setImageIndex(0);
     setFlow("assign");
+    if (hadBatch) window.history.pushState({}, "", batchUrl(activeBatchId, "assign"));
   }
 
   async function removeImage(image: BatchImage) {
@@ -732,7 +895,7 @@ export function RecipeImporter() {
   function startGrouping() {
     if (!images.length) return;
     setImageIndex(0);
-    setFlow("assign");
+    goToFlow("assign");
   }
 
   function findNextUnresolved(fromIndex: number, nextImages: BatchImage[]) {
@@ -828,7 +991,7 @@ export function RecipeImporter() {
   }
 
   async function createDrafts() {
-    setFlow("processing");
+    goToFlow("processing");
     setProcessingProgress(0);
     setProcessingMessage("Connecting securely to Qwen…");
 
@@ -939,7 +1102,7 @@ export function RecipeImporter() {
       setDrafts(nextDrafts);
       setDraftIndex(0);
       setDetailsOpen(false);
-      setFlow("review");
+      goToFlow("review");
     }, 250);
   }
 
@@ -1047,7 +1210,7 @@ export function RecipeImporter() {
         imported.push({ draftId: draft.id, title: payload.page.title, url: payload.page.url });
         setNotionResults([...imported]);
       }
-      setFlow("results");
+      goToFlow("results");
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : "The batch could not be imported into Notion.");
     } finally {
@@ -1055,18 +1218,8 @@ export function RecipeImporter() {
     }
   }
 
-  async function startNewBatch() {
-    images.forEach((image) => {
-      if (!image.samplePath) URL.revokeObjectURL(image.url);
-    });
-    await clearImageBlobs();
-    localStorage.removeItem(STORAGE_KEY);
-    setImages([]);
-    setDrafts([]);
-    setImageIndex(0);
-    setDraftIndex(0);
-    setNotionResults([]);
-    setFlow("upload");
+  function startNewBatch() {
+    openFreshStart();
   }
 
   if (!hydrated) {
@@ -1097,7 +1250,7 @@ export function RecipeImporter() {
       </aside>
 
       <header className="topbar">
-        <button className="brand" type="button" onClick={() => setFlow("upload")} aria-label="Recipe Press home">
+        <button className="brand" type="button" onClick={openFreshStart} aria-label="Recipe Press home">
           <span className="brand-mark" aria-hidden="true">R/P</span>
           <span>Recipe Press</span>
         </button>
@@ -1159,6 +1312,32 @@ export function RecipeImporter() {
                 </figure>
               ))}
             </div>
+          ) : null}
+
+          {!batchId && savedBatches.length ? (
+            <section className="saved-batches" aria-labelledby="saved-batches-title">
+              <div className="saved-batches__heading">
+                <div>
+                  <p className="eyebrow">Saved locally on this device</p>
+                  <h2 id="saved-batches-title">Previous sessions</h2>
+                </div>
+                <span>{savedBatches.length}</span>
+              </div>
+              <div className="saved-batches__list">
+                {savedBatches.map((savedBatch) => (
+                  <button type="button" key={savedBatch.id} onClick={() => openSavedBatch(savedBatch)}>
+                    <span className="saved-batches__icon">
+                      {savedBatch.importedCount ? <CircleCheck size={20} /> : <FileText size={20} />}
+                    </span>
+                    <span className="saved-batches__copy">
+                      <strong>{savedBatch.title}</strong>
+                      <small>{formatSavedBatchDate(savedBatch.updatedAt)} · {savedBatchLabel(savedBatch)}</small>
+                    </span>
+                    <ChevronRight size={20} aria-hidden="true" />
+                  </button>
+                ))}
+              </div>
+            </section>
           ) : null}
 
           <div className="view-footer">
@@ -1230,8 +1409,8 @@ export function RecipeImporter() {
           </div>
 
           <div className="view-footer">
-            <button className="button button--ghost" type="button" onClick={() => setFlow("upload")}>Back to upload</button>
-            <button className="button button--primary button--large" type="button" disabled={!allAssigned || !assignedGroups.length} onClick={() => setFlow("groups")}>
+            <button className="button button--ghost" type="button" onClick={() => goToFlow("upload")}>Back to upload</button>
+            <button className="button button--primary button--large" type="button" disabled={!allAssigned || !assignedGroups.length} onClick={() => goToFlow("groups")}>
               Review {assignedGroups.length || ""} group{assignedGroups.length === 1 ? "" : "s"}
             </button>
           </div>
@@ -1278,7 +1457,7 @@ export function RecipeImporter() {
           </div>
 
           <div className="view-footer">
-            <button className="button button--ghost" type="button" onClick={() => setFlow("assign")}>Change assignments</button>
+            <button className="button button--ghost" type="button" onClick={() => goToFlow("assign")}>Change assignments</button>
             <button className="button button--primary button--large" type="button" onClick={() => void createDrafts()}><Sparkles size={18} /> Create drafts</button>
           </div>
         </section>
@@ -1405,7 +1584,7 @@ export function RecipeImporter() {
             <div><strong>Imported successfully</strong><p>Finished-dish photos are stored in Notion and used as the first page block whenever an image was available.</p></div>
           </div>
 
-          <button className="button button--primary button--large" type="button" onClick={() => void startNewBatch()}><RotateCcw size={18} /> Start another batch</button>
+          <button className="button button--primary button--large" type="button" onClick={startNewBatch}><RotateCcw size={18} /> Start another batch</button>
         </section>
       ) : null}
 
