@@ -1,11 +1,14 @@
 "use client";
 
 import {
+  ArrowLeft,
+  BarChart3,
   Check,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   CircleCheck,
+  CircleDollarSign,
   Crop,
   FileText,
   ImagePlus,
@@ -13,6 +16,7 @@ import {
   Maximize2,
   Plus,
   RotateCcw,
+  RefreshCw,
   Sparkles,
   Trash2,
   Upload,
@@ -20,7 +24,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteImageBlob,
   loadImageBlob,
@@ -89,6 +93,7 @@ const BATCH_INDEX_KEY = "recipe-press:batches:v2";
 const PUBLIC_BASE = import.meta.env.BASE_URL || "/";
 const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/extract-recipe";
 const NOTION_IMPORT_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/import-notion";
+const USAGE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/usage";
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
@@ -689,6 +694,116 @@ function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => 
   );
 }
 
+type UsageSummary = {
+  model: string;
+  tokens: { prompt: number; completion: number; total: number; requests: number; trackingStartedAt: string; updatedAt: string | null };
+  cost: { total: number; today: number; week: number; month: number; tracked: number; limit: number | null; remaining: number | null; reset: string | null };
+};
+
+function formatUsd(value: number) {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: value < 1 ? 4 : 2,
+    maximumFractionDigits: value < 1 ? 4 : 2,
+  }).format(value);
+}
+
+function UsageDashboard({ onBack }: { onBack: () => void }) {
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const loadUsage = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(USAGE_API_URL, {
+        cache: "no-store",
+        headers: { Authorization: `Bearer ${password}` },
+      });
+      const payload = await response.json() as UsageSummary & { error?: string };
+      if (!response.ok) throw new Error(payload.error || "Usage data could not be loaded.");
+      setUsage(payload);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Usage data could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  }, [password]);
+
+  if (!usage) {
+    return (
+      <section className="workspace dashboard-view dashboard-view--locked page-enter">
+        <div className="dashboard-lock">
+          <span className="usage-card__icon"><BarChart3 size={24} /></span>
+          <p className="eyebrow">Private API dashboard</p>
+          <h1>Unlock<br /><em>the numbers.</em></h1>
+          <p>Enter the Recipe Press dashboard password. It is used only for this request and is not saved in your browser.</p>
+          <form onSubmit={(event) => { event.preventDefault(); void loadUsage(); }}>
+            <label className="field">
+              <span>Dashboard password</span>
+              <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus />
+            </label>
+            {error ? <div className="notice notice--error"><CircleAlert size={18} /><p>{error}</p></div> : null}
+            <button className="button button--primary" type="submit" disabled={!password || loading}>
+              {loading ? <><LoaderCircle className="spin" size={17} /> Checking…</> : <>Open dashboard <ChevronRight size={17} /></>}
+            </button>
+          </form>
+          <button className="button button--ghost dashboard-back" type="button" onClick={onBack}><ArrowLeft size={17} /> Back to recipes</button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="workspace dashboard-view page-enter">
+      <div className="dashboard-heading">
+        <div>
+          <p className="eyebrow">API observatory</p>
+          <h1>Usage,<br /><em>at a glance.</em></h1>
+          <p>Live spending from OpenRouter, with persistent token tracking for Recipe Press.</p>
+        </div>
+        <button className="button button--secondary" type="button" onClick={() => void loadUsage()} disabled={loading}>
+          <RefreshCw className={loading ? "spin" : ""} size={17} /> Refresh
+        </button>
+      </div>
+
+      {error ? <div className="notice notice--error"><CircleAlert size={18} /><p>{error}</p></div> : null}
+
+      <div className="usage-grid" aria-live="polite">
+        <article className="usage-card usage-card--hero">
+          <span className="usage-card__icon"><CircleDollarSign size={24} /></span>
+          <p>Lifetime API spend</p>
+          <strong>{usage ? formatUsd(usage.cost.total) : "—"}</strong>
+          <small>Exact total reported by this OpenRouter API key</small>
+        </article>
+        <article className="usage-card usage-card--hero usage-card--acid">
+          <span className="usage-card__icon"><BarChart3 size={24} /></span>
+          <p>Tokens tracked</p>
+          <strong>{usage ? new Intl.NumberFormat().format(usage.tokens.total) : "—"}</strong>
+          <small>{usage ? `${usage.tokens.requests} AI request${usage.tokens.requests === 1 ? "" : "s"} since tracking began` : "Loading persistent counter"}</small>
+        </article>
+        <article className="usage-card"><p>Today</p><strong>{usage ? formatUsd(usage.cost.today) : "—"}</strong></article>
+        <article className="usage-card"><p>This week</p><strong>{usage ? formatUsd(usage.cost.week) : "—"}</strong></article>
+        <article className="usage-card"><p>This month</p><strong>{usage ? formatUsd(usage.cost.month) : "—"}</strong></article>
+        <article className="usage-card"><p>Input tokens</p><strong>{usage ? new Intl.NumberFormat().format(usage.tokens.prompt) : "—"}</strong></article>
+        <article className="usage-card"><p>Output tokens</p><strong>{usage ? new Intl.NumberFormat().format(usage.tokens.completion) : "—"}</strong></article>
+        <article className="usage-card"><p>Tracked cost</p><strong>{usage ? formatUsd(usage.cost.tracked) : "—"}</strong></article>
+      </div>
+
+      <div className="usage-footnote">
+        <div><span>Model</span><strong>{usage?.model || "Qwen 3.5"}</strong></div>
+        <div><span>Token tracking began</span><strong>{usage ? new Date(usage.tokens.trackingStartedAt).toLocaleString() : "—"}</strong></div>
+        <p>OpenRouter provides the exact lifetime cost for this key. Historical token totals were not available through the inference key, so the token counter starts from the date above.</p>
+      </div>
+
+      <button className="button button--ghost dashboard-back" type="button" onClick={onBack}><ArrowLeft size={17} /> Back to recipes</button>
+    </section>
+  );
+}
+
 export function RecipeImporter() {
   const [batchId, setBatchId] = useState<string | null>(null);
   const [flow, setFlow] = useState<FlowStep>("upload");
@@ -708,6 +823,7 @@ export function RecipeImporter() {
   const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
   const [savedBatches, setSavedBatches] = useState<SavedBatchSummary[]>([]);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
+  const [dashboardOpen, setDashboardOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -729,6 +845,12 @@ export function RecipeImporter() {
         localStorage.removeItem(LEGACY_STORAGE_KEY);
       }
       setSavedBatches(index);
+
+      if (window.location.hash === "#/dashboard") {
+        setDashboardOpen(true);
+        setHydrated(true);
+        return;
+      }
 
       const route = parseBatchRoute();
       if (!route) {
@@ -806,6 +928,11 @@ export function RecipeImporter() {
   useEffect(() => {
     if (!hydrated) return;
     function handleHistoryNavigation() {
+      if (window.location.hash === "#/dashboard") {
+        setDashboardOpen(true);
+        return;
+      }
+      setDashboardOpen(false);
       const route = parseBatchRoute();
       if (!route) {
         window.location.reload();
@@ -871,8 +998,14 @@ export function RecipeImporter() {
     setNotionResults([]);
     setSubmitError("");
     setFlow("upload");
+    setDashboardOpen(false);
     setSavedBatches(readBatchIndex());
     window.history.pushState({}, "", publicAsset(""));
+  }
+
+  function openDashboard() {
+    setDashboardOpen(true);
+    window.history.pushState({}, "", `${publicAsset("")}#/dashboard`);
   }
 
   function openSavedBatch(savedBatch: SavedBatchSummary) {
@@ -1278,20 +1411,23 @@ export function RecipeImporter() {
 
   const activeStep = activeWorkflowIndex(flow);
   const railImage = images[imageIndex]?.url ?? sampleDishPath;
-  const railPhase = ["Collect", "Pair", "Refine", "Archive"][activeStep];
+  const railPhase = dashboardOpen ? "API dashboard" : ["Collect", "Pair", "Refine", "Archive"][activeStep];
 
   return (
     <main className="app-shell">
-      <aside className={`editorial-rail editorial-rail--${flow}`} aria-hidden="true">
+      <aside className={`editorial-rail editorial-rail--${dashboardOpen ? "dashboard" : flow}`}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={railImage} alt="" />
         <div className="editorial-rail__veil" />
         <div className="editorial-rail__copy">
           <span>Private cookbook archive</span>
           <h2>Recipe<br /><em>Press</em></h2>
-          <p>{String(activeStep + 1).padStart(2, "0")} / 04 — {railPhase}</p>
+          <p>{dashboardOpen ? railPhase : `${String(activeStep + 1).padStart(2, "0")} / 04 — ${railPhase}`}</p>
         </div>
-        <div className="editorial-rail__issue">VOL. 01</div>
+        <div className="editorial-rail__issue">
+          <span>VOL. 01</span>
+          <button type="button" className={dashboardOpen ? "is-active" : ""} onClick={openDashboard}>Dashboard</button>
+        </div>
       </aside>
 
       <header className="topbar">
@@ -1299,21 +1435,23 @@ export function RecipeImporter() {
           <span className="brand-mark" aria-hidden="true">R/P</span>
           <span>Recipe Press</span>
         </button>
-        {flow !== "upload" && flow !== "results" ? (
+        {!dashboardOpen && flow !== "upload" && flow !== "results" ? (
           <span className="save-state"><CircleCheck size={16} /> Saved locally</span>
         ) : null}
       </header>
 
-      <nav className="workflow" aria-label="Import progress">
+      {!dashboardOpen ? <nav className="workflow" aria-label="Import progress">
         {workflow.map((step, index) => (
           <div className={`workflow-step ${index === activeStep ? "is-active" : ""} ${index < activeStep ? "is-done" : ""}`} key={step.key}>
             <span>{index < activeStep ? <Check size={14} /> : index + 1}</span>
             <p>{step.label}</p>
           </div>
         ))}
-      </nav>
+      </nav> : null}
 
-      {flow === "upload" ? (
+      {dashboardOpen ? <UsageDashboard onBack={openFreshStart} /> : null}
+
+      {!dashboardOpen && flow === "upload" ? (
         <section className="workspace upload-view page-enter">
           <div className="section-heading">
             <p className="eyebrow">New cookbook batch</p>
@@ -1396,7 +1534,7 @@ export function RecipeImporter() {
         </section>
       ) : null}
 
-      {flow === "assign" && images[imageIndex] ? (
+      {!dashboardOpen && flow === "assign" && images[imageIndex] ? (
         <section className="workspace assign-view page-enter">
           <div className="compact-heading">
             <div>
@@ -1467,7 +1605,7 @@ export function RecipeImporter() {
         </section>
       ) : null}
 
-      {flow === "groups" ? (
+      {!dashboardOpen && flow === "groups" ? (
         <section className="workspace groups-view page-enter">
           <div className="section-heading section-heading--compact">
             <p className="eyebrow">Check the pairings</p>
@@ -1515,7 +1653,7 @@ export function RecipeImporter() {
         </section>
       ) : null}
 
-      {flow === "processing" ? (
+      {!dashboardOpen && flow === "processing" ? (
         <section className="workspace processing-view page-enter" aria-live="polite">
           <div className="processing-mark"><FileText size={35} /><Sparkles size={19} /></div>
           <p className="eyebrow">Creating {groups.length} draft{groups.length === 1 ? "" : "s"}</p>
@@ -1527,7 +1665,7 @@ export function RecipeImporter() {
         </section>
       ) : null}
 
-      {flow === "review" && activeDraft ? (
+      {!dashboardOpen && flow === "review" && activeDraft ? (
         <section className="workspace review-view page-enter">
           <div className="review-topline">
             <div>
@@ -1609,7 +1747,7 @@ export function RecipeImporter() {
         </section>
       ) : null}
 
-      {flow === "results" ? (
+      {!dashboardOpen && flow === "results" ? (
         <section className="workspace results-view page-enter">
           <div className="result-seal"><Check size={34} /></div>
           <p className="eyebrow">Batch complete</p>

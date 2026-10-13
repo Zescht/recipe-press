@@ -4,6 +4,7 @@ const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2026-03-11";
 const MAX_REQUEST_BYTES = 18 * 1024 * 1024;
 const MAX_IMAGES = 10;
+const USAGE_KEY = "recipe-press:usage:v1";
 
 const ALLOWED_ORIGINS = new Set([
   "https://zescht.github.io",
@@ -79,7 +80,7 @@ function corsHeaders(origin) {
   return {
     ...(allowed ? { "Access-Control-Allow-Origin": allowed } : {}),
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -94,6 +95,71 @@ function json(data, status = 200, origin = "") {
       ...corsHeaders(origin),
     },
   });
+}
+
+function emptyUsage() {
+  return {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    requests: 0,
+    trackedCost: 0,
+    trackingStartedAt: new Date().toISOString(),
+    updatedAt: null,
+  };
+}
+
+async function getTrackedUsage(env) {
+  if (!env.RECIPE_USAGE) return emptyUsage();
+  const existing = await env.RECIPE_USAGE.get(USAGE_KEY, "json");
+  if (existing) return existing;
+  const initial = emptyUsage();
+  await env.RECIPE_USAGE.put(USAGE_KEY, JSON.stringify(initial));
+  return initial;
+}
+
+async function recordUsage(env, usage) {
+  if (!env.RECIPE_USAGE || !usage) return;
+  const current = await getTrackedUsage(env);
+  const next = {
+    ...current,
+    promptTokens: current.promptTokens + Number(usage.prompt_tokens || 0),
+    completionTokens: current.completionTokens + Number(usage.completion_tokens || 0),
+    totalTokens: current.totalTokens + Number(usage.total_tokens || 0),
+    requests: current.requests + 1,
+    trackedCost: current.trackedCost + Number(usage.cost || 0),
+    updatedAt: new Date().toISOString(),
+  };
+  await env.RECIPE_USAGE.put(USAGE_KEY, JSON.stringify(next));
+}
+
+async function getOpenRouterKeyUsage(env) {
+  const response = await fetch("https://openrouter.ai/api/v1/key", {
+    headers: { Authorization: `Bearer ${env.OPENROUTER_API_KEY}` },
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenRouter usage returned HTTP ${response.status}.`);
+  return payload.data || {};
+}
+
+async function secureEqual(left, right) {
+  const encoder = new TextEncoder();
+  const [leftHash, rightHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(left)),
+    crypto.subtle.digest("SHA-256", encoder.encode(right)),
+  ]);
+  const a = new Uint8Array(leftHash);
+  const b = new Uint8Array(rightHash);
+  let difference = 0;
+  for (let index = 0; index < a.length; index += 1) difference |= a[index] ^ b[index];
+  return difference === 0;
+}
+
+async function dashboardIsAuthorized(request, env) {
+  if (!env.DASHBOARD_PASSWORD) return false;
+  const authorization = request.headers.get("Authorization") || "";
+  const supplied = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  return secureEqual(supplied, env.DASHBOARD_PASSWORD);
 }
 
 function isAllowedDataUrl(value) {
@@ -297,6 +363,47 @@ const worker = {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/usage") {
+      if (origin && !ALLOWED_ORIGINS.has(origin)) {
+        return json({ error: "Origin not allowed." }, 403, origin);
+      }
+      if (!env.OPENROUTER_API_KEY) {
+        return json({ error: "OpenRouter is not configured on the server yet." }, 503, origin);
+      }
+      if (!env.DASHBOARD_PASSWORD) {
+        return json({ error: "Dashboard access is not configured on the server yet." }, 503, origin);
+      }
+      if (!(await dashboardIsAuthorized(request, env))) {
+        return json({ error: "Incorrect dashboard password." }, 401, origin);
+      }
+      try {
+        const [tracked, key] = await Promise.all([getTrackedUsage(env), getOpenRouterKeyUsage(env)]);
+        return json({
+          model: env.OPENROUTER_MODEL || DEFAULT_MODEL,
+          tokens: {
+            prompt: tracked.promptTokens,
+            completion: tracked.completionTokens,
+            total: tracked.totalTokens,
+            requests: tracked.requests,
+            trackingStartedAt: tracked.trackingStartedAt,
+            updatedAt: tracked.updatedAt,
+          },
+          cost: {
+            total: Number(key.usage || 0),
+            today: Number(key.usage_daily || 0),
+            week: Number(key.usage_weekly || 0),
+            month: Number(key.usage_monthly || 0),
+            tracked: Number(tracked.trackedCost || 0),
+            limit: key.limit == null ? null : Number(key.limit),
+            remaining: key.limit_remaining == null ? null : Number(key.limit_remaining),
+            reset: key.limit_reset || null,
+          },
+        }, 200, origin);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : "Usage data could not be loaded." }, 502, origin);
+      }
+    }
+
     const isExtractRequest = request.method === "POST" && url.pathname === "/v1/extract-recipe";
     const isNotionImportRequest = request.method === "POST" && url.pathname === "/v1/import-notion";
     if (!isExtractRequest && !isNotionImportRequest) {
@@ -387,6 +494,7 @@ const worker = {
           model: env.OPENROUTER_MODEL || DEFAULT_MODEL,
           temperature: 0.1,
           max_tokens: 5000,
+          usage: { include: true },
           reasoning: { enabled: false },
           response_format: {
             type: "json_schema",
@@ -422,6 +530,7 @@ const worker = {
 
     try {
       const recipe = parseModelJson(extractMessageText(result?.choices?.[0]?.message));
+      await recordUsage(env, result?.usage);
       return json(
         {
           recipe,
