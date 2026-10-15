@@ -116,6 +116,7 @@ const PUBLIC_BASE = import.meta.env.BASE_URL || "/";
 const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/extract-recipe";
 const NOTION_IMPORT_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/import-notion";
 const USAGE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/usage";
+const PROCESSING_ERRORS_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/processing-errors";
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
@@ -286,6 +287,21 @@ function localDiagnostic(stage: string, message: string, recipeGroup?: number, h
     httpStatus,
     ...(recipeGroup ? { recipeGroup } : {}),
   };
+}
+
+async function persistClientDiagnostic(diagnostic: ProcessingDiagnostic) {
+  if (!diagnostic.id.startsWith("local-")) return diagnostic;
+  try {
+    const response = await fetch(PROCESSING_ERRORS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ diagnostic }),
+    });
+    const payload = await response.json() as { diagnostic?: ProcessingDiagnostic };
+    return response.ok && payload.diagnostic ? payload.diagnostic : diagnostic;
+  } catch {
+    return diagnostic;
+  }
 }
 
 function ingredientRank(line: string) {
@@ -1282,13 +1298,13 @@ export function RecipeImporter() {
           try {
             parsed = await extractRecipeWithQwen(group);
           } catch (error) {
-            const diagnostic = error instanceof RecipeProcessingFailure
+            const diagnostic = await persistClientDiagnostic(error instanceof RecipeProcessingFailure
               ? error.diagnostic
               : localDiagnostic(
                   "image_preparation",
                   error instanceof Error ? error.message : "The recipe images could not be prepared for Qwen.",
                   group.number,
-                );
+                ));
             setProcessingMessage(`Qwen was unavailable. Using German browser OCR for recipe ${groupIndex + 1}…`);
             if (!worker) {
               const { createWorker, PSM } = await import("tesseract.js");
@@ -1359,12 +1375,12 @@ export function RecipeImporter() {
           setProcessingProgress((groupIndex + 1) / groups.length);
         }
       } catch (error) {
-        const diagnostic = error instanceof RecipeProcessingFailure
+        const diagnostic = await persistClientDiagnostic(error instanceof RecipeProcessingFailure
           ? error.diagnostic
           : localDiagnostic(
               "browser_ocr",
               error instanceof Error ? error.message : "The browser OCR could not create the recipe draft.",
-            );
+            ));
         nextDrafts = groups.map((group) =>
           buildDraft(group, {
             title: stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`),
@@ -1532,12 +1548,12 @@ export function RecipeImporter() {
       }
       goToFlow("results");
     } catch (error) {
-      const diagnostic = error instanceof RecipeProcessingFailure
+      const diagnostic = await persistClientDiagnostic(error instanceof RecipeProcessingFailure
         ? error.diagnostic
         : localDiagnostic(
             "notion_request",
             error instanceof Error ? error.message : "The batch could not be imported into Notion.",
-          );
+          ));
       setSubmitError(`${diagnostic.message} Error ${diagnostic.id}.`);
       setSubmitDiagnostics([diagnostic]);
     } finally {

@@ -496,7 +496,8 @@ const worker = {
 
     const isExtractRequest = request.method === "POST" && url.pathname === "/v1/extract-recipe";
     const isNotionImportRequest = request.method === "POST" && url.pathname === "/v1/import-notion";
-    if (!isExtractRequest && !isNotionImportRequest) {
+    const isClientErrorRequest = request.method === "POST" && url.pathname === "/v1/processing-errors";
+    if (!isExtractRequest && !isNotionImportRequest && !isClientErrorRequest) {
       return json({ error: "Not found." }, 404, origin);
     }
 
@@ -546,6 +547,28 @@ const worker = {
         httpStatus: 400,
         requestBytes,
       });
+    }
+
+    if (isClientErrorRequest) {
+      const submitted = body?.diagnostic || {};
+      const diagnostic = await storeProcessingError(env, {
+        stage: `client_${safeErrorText(submitted.stage, "unknown")}`,
+        message: safeErrorText(submitted.message, "The browser reported an unknown processing error."),
+        httpStatus: Number(submitted.httpStatus) || 500,
+        upstreamStatus: Number(submitted.upstreamStatus),
+        requestBytes,
+        recipeGroup: Number(submitted.recipeGroup),
+        imageCounts: submitted.imageCounts && typeof submitted.imageCounts === "object"
+          ? {
+              source: Number(submitted.imageCounts.source) || 0,
+              title: Number(submitted.imageCounts.title) || 0,
+              ingredients: Number(submitted.imageCounts.ingredients) || 0,
+              steps: Number(submitted.imageCounts.steps) || 0,
+              total: Number(submitted.imageCounts.total) || 0,
+            }
+          : undefined,
+      });
+      return json({ diagnostic }, 201, origin);
     }
 
     if (isNotionImportRequest) {
