@@ -57,6 +57,7 @@ type Draft = {
   servings: string;
   ingredients: string;
   steps: string;
+  displayImageId?: string;
   visited: boolean;
   deleted: boolean;
   warning?: string;
@@ -231,12 +232,14 @@ type ParsedRecipe = {
   ingredients: string;
   steps: string;
   servings?: string;
+  displayImageId?: string;
   warning?: string;
 };
 
 type QwenRecipe = {
   title: string;
   servings: string;
+  displayImageNumber: number;
   ingredients: string[];
   phases: { name: string; steps: string[] }[];
   warnings: string[];
@@ -464,13 +467,13 @@ async function cropImageForOcr(imageUrl: string, quad: CropQuad) {
   return canvas.toDataURL("image/jpeg", 0.9);
 }
 
-async function prepareFullImageForAi(imageUrl: string) {
+async function prepareFullImageForAi(imageUrl: string, maxDimension = 1800, quality = 0.84) {
   const image = new Image();
   image.decoding = "async";
   image.src = imageUrl;
   await image.decode();
 
-  const scale = Math.min(1, 1800 / Math.max(image.naturalWidth, image.naturalHeight));
+  const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
   canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
@@ -479,10 +482,10 @@ async function prepareFullImageForAi(imageUrl: string) {
   context.fillStyle = "#fff";
   context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", 0.84);
+  return canvas.toDataURL("image/jpeg", quality);
 }
 
-function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string): ParsedRecipe {
+function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string, sourceImages: BatchImage[]): ParsedRecipe {
   const ingredients = recipe.ingredients
     .map((line) => line.replace(/^[-â€¢Â·]\s*/, "").trim())
     .filter(Boolean)
@@ -503,13 +506,20 @@ function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string): ParsedReci
     ingredients: ingredients || "[Review and add the extracted ingredients]",
     steps: steps || "[Review and add the preparation steps]",
     servings: recipe.servings?.trim() || "",
+    displayImageId: Number.isInteger(recipe.displayImageNumber) && recipe.displayImageNumber > 0
+      ? sourceImages[recipe.displayImageNumber - 1]?.id
+      : undefined,
     warning: recipe.warnings?.filter(Boolean).join(" ") || undefined,
   };
 }
 
 async function extractRecipeWithQwen(group: { number: number; images: BatchImage[] }) {
   const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
-  const definedImages = group.images.filter((image) => image.ocrRegions).slice(0, 4);
+  const sourceImageRecords = group.images.slice(0, 4);
+  const sourceImages = await Promise.all(
+    sourceImageRecords.map((image) => prepareFullImageForAi(image.url, 900, 0.72)),
+  );
+  const definedImages = sourceImageRecords.filter((image) => image.ocrRegions);
   let titleImages: string[];
   let ingredientImages: string[];
   let stepImages: string[];
@@ -523,7 +533,7 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
       definedImages.map((image) => cropImageForOcr(image.url, image.ocrRegions!.steps)),
     );
   } else {
-    const fullImages = await Promise.all(group.images.slice(0, 4).map((image) => prepareFullImageForAi(image.url)));
+    const fullImages = await Promise.all(sourceImageRecords.map((image) => prepareFullImageForAi(image.url)));
     titleImages = fullImages.slice(0, 1);
     ingredientImages = fullImages;
     stepImages = fullImages;
@@ -532,13 +542,13 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
   const response = await fetch(RECIPE_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ titleImages, ingredientImages, stepImages }),
+    body: JSON.stringify({ sourceImages, titleImages, ingredientImages, stepImages }),
   });
   const payload = await response.json() as { recipe?: QwenRecipe; error?: string };
   if (!response.ok || !payload.recipe) {
     throw new Error(payload.error || "Qwen could not create the recipe draft.");
   }
-  return formatQwenRecipe(payload.recipe, fallbackTitle);
+  return formatQwenRecipe(payload.recipe, fallbackTitle, sourceImageRecords);
 }
 
 function RegionEditor({
@@ -1165,6 +1175,7 @@ export function RecipeImporter() {
       servings: useSampleDefaults ? "2" : parsed?.servings || "",
       ingredients: useSampleDefaults ? sampleIngredients : parsed?.ingredients || "[Review and add the extracted ingredients]",
       steps: useSampleDefaults ? sampleSteps : parsed?.steps || "[Review and add the preparation steps]",
+      displayImageId: useSampleDefaults ? "sample-dish" : parsed?.displayImageId,
       visited: false,
       deleted: false,
       warning: useSampleDefaults ? "Offline sample shown; Qwen was not contacted." : parsed?.warning,
@@ -1364,7 +1375,7 @@ export function RecipeImporter() {
       for (const draft of remainingDrafts) {
         if (imported.some((result) => result.draftId === draft.id)) continue;
         const group = groups.find((item) => item.number === draft.group);
-        const dishImage = [...(group?.images || [])].reverse().find((image) => !image.ocrRegions);
+        const dishImage = group?.images.find((image) => image.id === draft.displayImageId);
         const imageDataUrl = dishImage ? await prepareFullImageForAi(dishImage.url) : undefined;
         const response = await fetch(NOTION_IMPORT_URL, {
           method: "POST",

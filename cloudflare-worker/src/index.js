@@ -3,7 +3,7 @@ const DEFAULT_MODEL = "qwen/qwen3.5-flash-02-23";
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2026-03-11";
 const MAX_REQUEST_BYTES = 18 * 1024 * 1024;
-const MAX_IMAGES = 10;
+const MAX_IMAGES = 16;
 const USAGE_KEY = "recipe-press:usage:v1";
 
 const ALLOWED_ORIGINS = new Set([
@@ -23,6 +23,7 @@ const RECIPE_SCHEMA = {
     properties: {
       title: { type: "string" },
       servings: { type: "string" },
+      displayImageNumber: { type: "integer", minimum: 0 },
       ingredients: {
         type: "array",
         items: { type: "string" },
@@ -50,6 +51,7 @@ const RECIPE_SCHEMA = {
     required: [
       "title",
       "servings",
+      "displayImageNumber",
       "ingredients",
       "phases",
       "warnings",
@@ -72,6 +74,11 @@ Regeln:
 - Sortiere Zutaten ohne Zwischenüberschriften in dieser Reihenfolge: (1) Gemüse/Obst, (2) Fleisch/Fisch/Protein, (3) Milch-/Joghurtprodukte, (4) Sonstiges, (5) typische Vorräte wie Öl, Salz und Pfeffer. Behalte innerhalb einer Gruppe die Quellreihenfolge bei.
 - phases enthält die Zubereitung in sinnvollen Phasen. Jede Phase hat einen kurzen deutschen Namen und vollständige Arbeitsschritte. Bewahre Fakten, Reihenfolge, Temperaturen, Zeiten und Sichtmerkmale.
 - servings ist nur die Zahl, wenn eindeutig vorhanden, sonst eine leere Zeichenfolge.
+- Die ORIGINALAUFNAHMEN sind in ihrer Upload-Reihenfolge nummeriert. displayImageNumber ist die Nummer der Aufnahme, auf der das fertig zubereitete Essen das eindeutige Hauptmotiv ist.
+- Wähle niemals eine Kochbuchseite, Rezepttext, Zutatenliste oder Zubereitungsseite als displayImageNumber, auch wenn darauf ein kleines Gerichtsfoto oder dekoratives Essen zu sehen ist.
+- Eine gültige Displayaufnahme zeigt hauptsächlich das reale fertige Gericht, etwa angerichtet auf einem Teller, in einer Schüssel oder in einem Topf, und nicht hauptsächlich gedruckten Text oder eine Buchseite.
+- Wenn keine eindeutige Aufnahme des fertigen Gerichts vorhanden ist, setze displayImageNumber auf 0. Rate nicht.
+- Wenn displayImageNumber 0 ist, ergänze in warnings den Hinweis, dass kein eindeutiges Foto des fertigen Gerichts erkannt wurde und deshalb kein Thumbnail importiert wird.
 - Wenn kein Titel sicher sichtbar ist, title leer lassen und eine Warnung ergänzen.
 - Antworte ausschließlich im vorgegebenen JSON-Schema.`;
 
@@ -180,6 +187,15 @@ function addImageSection(content, title, images) {
   for (const image of images) {
     content.push({ type: "image_url", image_url: { url: image } });
   }
+}
+
+function addIndexedImageSection(content, title, images) {
+  if (!images.length) return;
+  content.push({ type: "text", text: title });
+  images.forEach((image, index) => {
+    content.push({ type: "text", text: `ORIGINALAUFNAHME ${index + 1}` });
+    content.push({ type: "image_url", image_url: { url: image } });
+  });
 }
 
 function extractMessageText(message) {
@@ -450,10 +466,12 @@ const worker = {
       }
     }
 
+    let sourceImages;
     let titleImages;
     let ingredientImages;
     let stepImages;
     try {
+      sourceImages = normalizeImages(body.sourceImages, "sourceImages");
       titleImages = normalizeImages(body.titleImages, "titleImages");
       ingredientImages = normalizeImages(body.ingredientImages, "ingredientImages");
       stepImages = normalizeImages(body.stepImages, "stepImages");
@@ -461,10 +479,10 @@ const worker = {
       return json({ error: error instanceof Error ? error.message : "Invalid images." }, 400, origin);
     }
 
-    const imageCount = titleImages.length + ingredientImages.length + stepImages.length;
-    if (!ingredientImages.length || !stepImages.length || imageCount > MAX_IMAGES) {
+    const imageCount = sourceImages.length + titleImages.length + ingredientImages.length + stepImages.length;
+    if (!sourceImages.length || !ingredientImages.length || !stepImages.length || imageCount > MAX_IMAGES) {
       return json(
-        { error: `Provide at least one ingredient image and one step image, with no more than ${MAX_IMAGES} images total.` },
+        { error: `Provide original, ingredient, and step images, with no more than ${MAX_IMAGES} images total.` },
         400,
         origin,
       );
@@ -476,6 +494,7 @@ const worker = {
         text: "Erstelle aus den folgenden Bildausschnitten einen strukturierten deutschen Rezeptentwurf. Die Bereiche wurden vom Nutzer bereits zugeordnet.",
       },
     ];
+    addIndexedImageSection(userContent, "ORIGINALAUFNAHMEN FÜR DIE DISPLAYBILD-AUSWAHL:", sourceImages);
     addImageSection(userContent, "GANZE SEITE ODER TITELBEREICH:", titleImages.slice(0, 1));
     addImageSection(userContent, "ZUTATENBEREICH(E):", ingredientImages);
     addImageSection(userContent, "ZUBEREITUNGSBEREICH(E):", stepImages);
