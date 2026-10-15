@@ -5,6 +5,10 @@ const NOTION_VERSION = "2026-03-11";
 const MAX_REQUEST_BYTES = 18 * 1024 * 1024;
 const MAX_IMAGES = 16;
 const USAGE_KEY = "recipe-press:usage:v1";
+const ERROR_INDEX_KEY = "recipe-press:processing-errors:v1";
+const ERROR_KEY_PREFIX = "recipe-press:processing-error:";
+const MAX_ERROR_RECORDS = 50;
+const ERROR_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 const ALLOWED_ORIGINS = new Set([
   "https://zescht.github.io",
@@ -138,6 +142,59 @@ async function recordUsage(env, usage) {
     updatedAt: new Date().toISOString(),
   };
   await env.RECIPE_USAGE.put(USAGE_KEY, JSON.stringify(next));
+}
+
+function safeErrorText(value, fallback) {
+  const text = typeof value === "string" ? value : fallback;
+  return text.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 800);
+}
+
+async function storeProcessingError(env, details) {
+  const record = {
+    id: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    stage: safeErrorText(details.stage, "unknown"),
+    message: safeErrorText(details.message, "An unknown processing error occurred."),
+    httpStatus: Number(details.httpStatus) || 500,
+    ...(Number.isFinite(details.upstreamStatus) ? { upstreamStatus: Number(details.upstreamStatus) } : {}),
+    model: env.OPENROUTER_MODEL || DEFAULT_MODEL,
+    ...(Number.isFinite(details.recipeGroup) ? { recipeGroup: Number(details.recipeGroup) } : {}),
+    ...(Number.isFinite(details.requestBytes) ? { requestBytes: Number(details.requestBytes) } : {}),
+    ...(details.imageCounts ? { imageCounts: details.imageCounts } : {}),
+  };
+
+  if (!env.RECIPE_USAGE) return record;
+  try {
+    await env.RECIPE_USAGE.put(`${ERROR_KEY_PREFIX}${record.id}`, JSON.stringify(record), {
+      expirationTtl: ERROR_TTL_SECONDS,
+    });
+    const current = await env.RECIPE_USAGE.get(ERROR_INDEX_KEY, "json");
+    const ids = Array.isArray(current) ? current.filter((id) => typeof id === "string") : [];
+    await env.RECIPE_USAGE.put(
+      ERROR_INDEX_KEY,
+      JSON.stringify([record.id, ...ids.filter((id) => id !== record.id)].slice(0, MAX_ERROR_RECORDS)),
+    );
+  } catch {
+    // Returning the diagnostic to the browser is still useful if KV storage is temporarily unavailable.
+  }
+  return record;
+}
+
+async function processingErrorResponse(env, origin, details) {
+  const diagnostic = await storeProcessingError(env, details);
+  return json({ error: diagnostic.message, diagnostic }, diagnostic.httpStatus, origin);
+}
+
+async function getProcessingErrors(env, id) {
+  if (!env.RECIPE_USAGE) return [];
+  if (id) {
+    const record = await env.RECIPE_USAGE.get(`${ERROR_KEY_PREFIX}${id}`, "json");
+    return record ? [record] : [];
+  }
+  const current = await env.RECIPE_USAGE.get(ERROR_INDEX_KEY, "json");
+  const ids = Array.isArray(current) ? current.slice(0, MAX_ERROR_RECORDS) : [];
+  return (await Promise.all(ids.map((item) => env.RECIPE_USAGE.get(`${ERROR_KEY_PREFIX}${item}`, "json"))))
+    .filter(Boolean);
 }
 
 async function getOpenRouterKeyUsage(env) {
@@ -420,6 +477,23 @@ const worker = {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/processing-errors") {
+      if (origin && !ALLOWED_ORIGINS.has(origin)) {
+        return json({ error: "Origin not allowed." }, 403, origin);
+      }
+      if (!env.DASHBOARD_PASSWORD) {
+        return json({ error: "Diagnostic access is not configured on the server yet." }, 503, origin);
+      }
+      if (!(await dashboardIsAuthorized(request, env))) {
+        return json({ error: "Incorrect dashboard password." }, 401, origin);
+      }
+      const records = await getProcessingErrors(env, url.searchParams.get("id") || "");
+      if (url.searchParams.has("id") && !records.length) {
+        return json({ error: "No stored processing error was found for that ID." }, 404, origin);
+      }
+      return json({ errors: records }, 200, origin);
+    }
+
     const isExtractRequest = request.method === "POST" && url.pathname === "/v1/extract-recipe";
     const isNotionImportRequest = request.method === "POST" && url.pathname === "/v1/import-notion";
     if (!isExtractRequest && !isNotionImportRequest) {
@@ -431,26 +505,47 @@ const worker = {
     }
 
     if (isExtractRequest && !env.OPENROUTER_API_KEY) {
-      return json({ error: "OPENROUTER_API_KEY is not configured." }, 500, origin);
+      return processingErrorResponse(env, origin, {
+        stage: "configuration",
+        message: "OPENROUTER_API_KEY is not configured.",
+        httpStatus: 500,
+      });
     }
     if (isNotionImportRequest && (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)) {
       return json({ error: "Notion is not configured on the server yet." }, 503, origin);
     }
 
     const contentLength = Number(request.headers.get("Content-Length") || 0);
+    let requestBytes = contentLength;
     if (contentLength > MAX_REQUEST_BYTES) {
-      return json({ error: "The image upload is too large." }, 413, origin);
+      return processingErrorResponse(env, origin, {
+        stage: "request_validation",
+        message: "The image upload is too large.",
+        httpStatus: 413,
+        requestBytes: contentLength,
+      });
     }
 
     let body;
     try {
       const raw = await request.text();
-      if (new TextEncoder().encode(raw).byteLength > MAX_REQUEST_BYTES) {
-        return json({ error: "The image upload is too large." }, 413, origin);
+      requestBytes = new TextEncoder().encode(raw).byteLength;
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        return processingErrorResponse(env, origin, {
+          stage: "request_validation",
+          message: "The image upload is too large.",
+          httpStatus: 413,
+          requestBytes,
+        });
       }
       body = JSON.parse(raw);
     } catch {
-      return json({ error: "Request body must be valid JSON." }, 400, origin);
+      return processingErrorResponse(env, origin, {
+        stage: "request_validation",
+        message: "Request body must be valid JSON.",
+        httpStatus: 400,
+        requestBytes,
+      });
     }
 
     if (isNotionImportRequest) {
@@ -458,11 +553,13 @@ const worker = {
         const result = await importRecipeToNotion(body.recipe, env);
         return json({ page: result }, 201, origin);
       } catch (error) {
-        return json(
-          { error: error instanceof Error ? error.message : "The recipe could not be imported into Notion." },
-          502,
-          origin,
-        );
+        return processingErrorResponse(env, origin, {
+          stage: "notion_import",
+          message: error instanceof Error ? error.message : "The recipe could not be imported into Notion.",
+          httpStatus: 502,
+          requestBytes,
+          recipeGroup: body?.recipeGroup,
+        });
       }
     }
 
@@ -476,16 +573,32 @@ const worker = {
       ingredientImages = normalizeImages(body.ingredientImages, "ingredientImages");
       stepImages = normalizeImages(body.stepImages, "stepImages");
     } catch (error) {
-      return json({ error: error instanceof Error ? error.message : "Invalid images." }, 400, origin);
+      return processingErrorResponse(env, origin, {
+        stage: "image_validation",
+        message: error instanceof Error ? error.message : "Invalid images.",
+        httpStatus: 400,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+      });
     }
 
     const imageCount = sourceImages.length + titleImages.length + ingredientImages.length + stepImages.length;
+    const imageCounts = {
+      source: sourceImages.length,
+      title: titleImages.length,
+      ingredients: ingredientImages.length,
+      steps: stepImages.length,
+      total: imageCount,
+    };
     if (!sourceImages.length || !ingredientImages.length || !stepImages.length || imageCount > MAX_IMAGES) {
-      return json(
-        { error: `Provide original, ingredient, and step images, with no more than ${MAX_IMAGES} images total.` },
-        400,
-        origin,
-      );
+      return processingErrorResponse(env, origin, {
+        stage: "image_validation",
+        message: `Provide original, ingredient, and step images, with no more than ${MAX_IMAGES} images total.`,
+        httpStatus: 400,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+        imageCounts,
+      });
     }
 
     const userContent = [
@@ -525,26 +638,42 @@ const worker = {
           ],
         }),
       });
-    } catch {
-      return json({ error: "OpenRouter could not be reached." }, 502, origin);
+    } catch (error) {
+      return processingErrorResponse(env, origin, {
+        stage: "openrouter_request",
+        message: error instanceof Error ? `OpenRouter could not be reached: ${error.message}` : "OpenRouter could not be reached.",
+        httpStatus: 502,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+        imageCounts,
+      });
     }
 
     let result;
     try {
       result = await upstream.json();
     } catch {
-      return json({ error: "OpenRouter returned an unreadable response." }, 502, origin);
+      return processingErrorResponse(env, origin, {
+        stage: "openrouter_response",
+        message: "OpenRouter returned an unreadable response.",
+        httpStatus: 502,
+        upstreamStatus: upstream.status,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+        imageCounts,
+      });
     }
 
     if (!upstream.ok) {
-      return json(
-        {
-          error: result?.error?.message || "OpenRouter rejected the request.",
-          upstreamStatus: upstream.status,
-        },
-        502,
-        origin,
-      );
+      return processingErrorResponse(env, origin, {
+        stage: "openrouter_response",
+        message: result?.error?.message || "OpenRouter rejected the request.",
+        httpStatus: 502,
+        upstreamStatus: upstream.status,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+        imageCounts,
+      });
     }
 
     try {
@@ -565,8 +694,18 @@ const worker = {
         200,
         origin,
       );
-    } catch {
-      return json({ error: "The AI response did not match the recipe format." }, 502, origin);
+    } catch (error) {
+      return processingErrorResponse(env, origin, {
+        stage: "response_parsing",
+        message: error instanceof Error
+          ? `The AI response did not match the recipe format: ${error.message}`
+          : "The AI response did not match the recipe format.",
+        httpStatus: 502,
+        upstreamStatus: upstream.status,
+        requestBytes,
+        recipeGroup: body?.recipeGroup,
+        imageCounts,
+      });
     }
   },
 };

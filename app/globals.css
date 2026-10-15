@@ -261,6 +261,10 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .delete-button:hover { background:var(--danger); color:#fff; }
 .notice { margin:0 0 18px; padding:13px 15px; border-left:6px solid #a67a08; background:#f5e8bb; color:#5b4713; font-family:var(--mono); font-size:.76rem; line-height:1.5; }
 .notice--error { border-color:var(--danger); background:#f2d3d2; color:#741f23; }
+.notice--with-action { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:10px; }
+.notice--with-action p { margin:0; }
+.notice--with-action button { min-height:36px; padding:0 10px; border:1px solid currentColor; background:transparent; color:inherit; font:700 .68rem/1 var(--mono); text-transform:uppercase; cursor:pointer; }
+.notice--with-action button:hover { background:currentColor; color:var(--paper-bright); }
 .review-form { display:grid; gap:26px; }
 .field,.field-group { display:grid; gap:9px; }
 .field>span,.field-group>legend { color:var(--muted); font-family:var(--mono); font-size:.7rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase; }
@@ -311,6 +315,16 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .dialog h3 { font-size:2rem; }
 .dialog p { color:var(--muted); line-height:1.55; }
 .dialog .dropzone-actions { justify-content:flex-end; }
+.diagnostic-dialog { width:min(100%,680px); max-height:min(86vh,760px); overflow:auto; }
+.diagnostic-dialog h2 { margin-bottom:8px; font-size:2.35rem; }
+.diagnostic-dialog .diagnostic-intro { margin-top:0; }
+.diagnostic-records { margin:22px 0; display:grid; gap:14px; }
+.diagnostic-records dl { margin:0; padding:14px; border:1px solid var(--ink); background:var(--paper); font-family:var(--mono); }
+.diagnostic-records dl>div { padding:6px 0; border-bottom:1px solid #d5d3c8; display:grid; grid-template-columns:130px minmax(0,1fr); gap:12px; }
+.diagnostic-records dl>div:last-child { border-bottom:0; }
+.diagnostic-records dt { color:var(--muted); font-size:.66rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+.diagnostic-records dd { min-width:0; margin:0; font-size:.72rem; line-height:1.45; overflow-wrap:anywhere; }
+.diagnostic-actions { display:flex; justify-content:flex-end; gap:9px; }
 .undo-toast { position:fixed; z-index:25; left:50%; bottom:calc(18px + env(safe-area-inset-bottom)); width:min(calc(100% - 32px),440px); min-height:58px; padding:8px 9px 8px 17px; border:1px solid var(--acid); display:flex; align-items:center; justify-content:space-between; gap:16px; background:var(--ink); color:#fff; font-family:var(--mono); font-size:.75rem; transform:translateX(-50%); }
 .undo-toast button { min-height:38px; padding:0 13px; border:0; background:var(--acid); color:var(--ink); font-family:var(--mono); font-weight:800; text-transform:uppercase; cursor:pointer; }
 .spin { animation:spin .85s linear infinite; }
@@ -398,6 +412,15 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
   .image-preview__stage { padding:10px; }
   .image-preview__controls { min-height:70px; padding:10px 14px calc(10px + env(safe-area-inset-bottom)); }
   .image-preview__controls>span { display:none; }
+}
+
+@media (max-width:560px) {
+  .notice--with-action { grid-template-columns:auto minmax(0,1fr); }
+  .notice--with-action button { grid-column:1/-1; }
+  .diagnostic-dialog { padding:22px; }
+  .diagnostic-records dl>div { grid-template-columns:1fr; gap:3px; }
+  .diagnostic-actions { flex-direction:column-reverse; }
+  .diagnostic-actions .button { width:100%; }
 }
 
 @media (max-width:420px) {

@@ -9,6 +9,7 @@ import {
   CircleAlert,
   CircleCheck,
   CircleDollarSign,
+  ClipboardCopy,
   Crop,
   FileText,
   ImagePlus,
@@ -38,6 +39,25 @@ type CropQuad = [CropPoint, CropPoint, CropPoint, CropPoint];
 type OcrRegions = { ingredients: CropQuad; steps: CropQuad };
 type PreviewImage = { src: string; alt: string; name: string };
 
+type ProcessingDiagnostic = {
+  id: string;
+  timestamp: string;
+  stage: string;
+  message: string;
+  httpStatus: number;
+  upstreamStatus?: number;
+  model?: string;
+  recipeGroup?: number;
+  requestBytes?: number;
+  imageCounts?: {
+    source: number;
+    title: number;
+    ingredients: number;
+    steps: number;
+    total: number;
+  };
+};
+
 type BatchImage = {
   id: string;
   name: string;
@@ -61,6 +81,7 @@ type Draft = {
   visited: boolean;
   deleted: boolean;
   warning?: string;
+  processingErrors?: ProcessingDiagnostic[];
 };
 
 type NotionResult = {
@@ -234,6 +255,7 @@ type ParsedRecipe = {
   servings?: string;
   displayImageId?: string;
   warning?: string;
+  processingErrors?: ProcessingDiagnostic[];
 };
 
 type QwenRecipe = {
@@ -244,6 +266,27 @@ type QwenRecipe = {
   phases: { name: string; steps: string[] }[];
   warnings: string[];
 };
+
+class RecipeProcessingFailure extends Error {
+  diagnostic: ProcessingDiagnostic;
+
+  constructor(diagnostic: ProcessingDiagnostic) {
+    super(diagnostic.message);
+    this.name = "RecipeProcessingFailure";
+    this.diagnostic = diagnostic;
+  }
+}
+
+function localDiagnostic(stage: string, message: string, recipeGroup?: number, httpStatus = 0): ProcessingDiagnostic {
+  return {
+    id: `local-${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    stage,
+    message,
+    httpStatus,
+    ...(recipeGroup ? { recipeGroup } : {}),
+  };
+}
 
 function ingredientRank(line: string) {
   const value = line.toLowerCase();
@@ -539,14 +582,42 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
     stepImages = fullImages;
   }
 
-  const response = await fetch(RECIPE_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sourceImages, titleImages, ingredientImages, stepImages }),
-  });
-  const payload = await response.json() as { recipe?: QwenRecipe; error?: string };
+  let response: Response;
+  try {
+    response = await fetch(RECIPE_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipeGroup: group.number,
+        sourceImages,
+        titleImages,
+        ingredientImages,
+        stepImages,
+      }),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The processing service could not be reached.";
+    throw new RecipeProcessingFailure(localDiagnostic("network_request", message, group.number));
+  }
+
+  let payload: { recipe?: QwenRecipe; error?: string; diagnostic?: ProcessingDiagnostic };
+  try {
+    payload = await response.json() as typeof payload;
+  } catch {
+    throw new RecipeProcessingFailure(localDiagnostic(
+      "worker_response",
+      `The processing service returned HTTP ${response.status} with an unreadable response.`,
+      group.number,
+      response.status,
+    ));
+  }
   if (!response.ok || !payload.recipe) {
-    throw new Error(payload.error || "Qwen could not create the recipe draft.");
+    throw new RecipeProcessingFailure(payload.diagnostic || localDiagnostic(
+      "recipe_extraction",
+      payload.error || "Qwen could not create the recipe draft.",
+      group.number,
+      response.status,
+    ));
   }
   return formatQwenRecipe(payload.recipe, fallbackTitle, sourceImageRecords);
 }
@@ -827,12 +898,15 @@ export function RecipeImporter() {
   const [undoDraft, setUndoDraft] = useState<string | null>(null);
   const [defineImageId, setDefineImageId] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState("");
+  const [submitDiagnostics, setSubmitDiagnostics] = useState<ProcessingDiagnostic[]>([]);
   const [processingMessage, setProcessingMessage] = useState("Connecting securely to Qwen…");
   const [processingProgress, setProcessingProgress] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
   const [savedBatches, setSavedBatches] = useState<SavedBatchSummary[]>([]);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
+  const [errorDetails, setErrorDetails] = useState<ProcessingDiagnostic[] | null>(null);
+  const [errorReportCopied, setErrorReportCopied] = useState(false);
   const [dashboardOpen, setDashboardOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -1179,6 +1253,7 @@ export function RecipeImporter() {
       visited: false,
       deleted: false,
       warning: useSampleDefaults ? "Offline sample shown; Qwen was not contacted." : parsed?.warning,
+      processingErrors: parsed?.processingErrors,
     };
   }
 
@@ -1206,7 +1281,14 @@ export function RecipeImporter() {
 
           try {
             parsed = await extractRecipeWithQwen(group);
-          } catch {
+          } catch (error) {
+            const diagnostic = error instanceof RecipeProcessingFailure
+              ? error.diagnostic
+              : localDiagnostic(
+                  "image_preparation",
+                  error instanceof Error ? error.message : "The recipe images could not be prepared for Qwen.",
+                  group.number,
+                );
             setProcessingMessage(`Qwen was unavailable. Using German browser OCR for recipe ${groupIndex + 1}…`);
             if (!worker) {
               const { createWorker, PSM } = await import("tesseract.js");
@@ -1251,6 +1333,7 @@ export function RecipeImporter() {
                 ingredients: ingredients || "[Review and add the extracted ingredients]",
                 steps: steps || "[Review and add the preparation steps]",
                 warning: warnings.join(" "),
+                processingErrors: [diagnostic],
               };
             } else {
               const pages: string[] = [];
@@ -1268,19 +1351,27 @@ export function RecipeImporter() {
                 : 0;
               parsed = parseRecipeText(pages.join("\n\n"), fallbackTitle, averageConfidence);
               parsed.warning = `Qwen was unavailable, so German browser OCR was used. ${parsed.warning || ""}`.trim();
+              parsed.processingErrors = [diagnostic];
             }
           }
 
           nextDrafts.push(buildDraft(group, parsed));
           setProcessingProgress((groupIndex + 1) / groups.length);
         }
-      } catch {
+      } catch (error) {
+        const diagnostic = error instanceof RecipeProcessingFailure
+          ? error.diagnostic
+          : localDiagnostic(
+              "browser_ocr",
+              error instanceof Error ? error.message : "The browser OCR could not create the recipe draft.",
+            );
         nextDrafts = groups.map((group) =>
           buildDraft(group, {
             title: stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`),
             ingredients: "[Review and add the extracted ingredients]",
             steps: "[Review and add the preparation steps]",
-            warning: "Neither Qwen nor the browser OCR could create this draft. Check your connection and try again.",
+            warning: `Neither Qwen nor the browser OCR could create this draft. Error ${diagnostic.id}.`,
+            processingErrors: [diagnostic],
           }),
         );
       } finally {
@@ -1304,6 +1395,29 @@ export function RecipeImporter() {
       current.map((draft, index) => (index === draftIndex ? { ...draft, ...patch } : draft)),
     );
     setSubmitError("");
+  }
+
+  function openErrorDetails(diagnostics: ProcessingDiagnostic[]) {
+    setErrorReportCopied(false);
+    setErrorDetails(diagnostics);
+  }
+
+  async function copyErrorReport() {
+    if (!errorDetails) return;
+    const report = errorDetails.map((item) => ({
+      errorId: item.id,
+      timestamp: item.timestamp,
+      stage: item.stage,
+      message: item.message,
+      httpStatus: item.httpStatus,
+      upstreamStatus: item.upstreamStatus,
+      model: item.model,
+      recipeGroup: item.recipeGroup,
+      requestBytes: item.requestBytes,
+      imageCounts: item.imageCounts,
+    }));
+    await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+    setErrorReportCopied(true);
   }
 
   function toggleCourse(course: string) {
@@ -1369,6 +1483,7 @@ export function RecipeImporter() {
       return;
     }
     setSubmitError("");
+    setSubmitDiagnostics([]);
     setIsSubmitting(true);
     try {
       const imported = [...notionResults];
@@ -1381,6 +1496,7 @@ export function RecipeImporter() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            recipeGroup: draft.group,
             recipe: {
               title: draft.title,
               courses: draft.courses,
@@ -1392,16 +1508,38 @@ export function RecipeImporter() {
             },
           }),
         });
-        const payload = await response.json() as { page?: { title: string; url: string }; error?: string };
+        let payload: { page?: { title: string; url: string }; error?: string; diagnostic?: ProcessingDiagnostic };
+        try {
+          payload = await response.json() as typeof payload;
+        } catch {
+          throw new RecipeProcessingFailure(localDiagnostic(
+            "notion_response",
+            `The Notion service returned HTTP ${response.status} with an unreadable response.`,
+            draft.group,
+            response.status,
+          ));
+        }
         if (!response.ok || !payload.page) {
-          throw new Error(payload.error || `Notion could not import ${draft.title}.`);
+          throw new RecipeProcessingFailure(payload.diagnostic || localDiagnostic(
+            "notion_import",
+            payload.error || `Notion could not import ${draft.title}.`,
+            draft.group,
+            response.status,
+          ));
         }
         imported.push({ draftId: draft.id, title: payload.page.title, url: payload.page.url });
         setNotionResults([...imported]);
       }
       goToFlow("results");
     } catch (error) {
-      setSubmitError(error instanceof Error ? error.message : "The batch could not be imported into Notion.");
+      const diagnostic = error instanceof RecipeProcessingFailure
+        ? error.diagnostic
+        : localDiagnostic(
+            "notion_request",
+            error instanceof Error ? error.message : "The batch could not be imported into Notion.",
+          );
+      setSubmitError(`${diagnostic.message} Error ${diagnostic.id}.`);
+      setSubmitDiagnostics([diagnostic]);
     } finally {
       setIsSubmitting(false);
     }
@@ -1688,8 +1826,24 @@ export function RecipeImporter() {
             <button className="delete-button" type="button" onClick={() => setDeleteTarget(activeDraft.id)}><Trash2 size={17} /> Delete</button>
           </div>
 
-          {activeDraft.warning ? <div className="notice"><CircleAlert size={18} /><p>{activeDraft.warning}</p></div> : null}
-          {submitError ? <div className="notice notice--error"><CircleAlert size={18} /><p>{submitError}</p></div> : null}
+          {activeDraft.warning || activeDraft.processingErrors?.length ? (
+            <div className="notice notice--with-action">
+              <CircleAlert size={18} />
+              <p>{activeDraft.warning || "A processing error occurred while this draft was created."}</p>
+              {activeDraft.processingErrors?.length ? (
+                <button type="button" onClick={() => openErrorDetails(activeDraft.processingErrors!)}>View error details</button>
+              ) : null}
+            </div>
+          ) : null}
+          {submitError ? (
+            <div className="notice notice--error notice--with-action">
+              <CircleAlert size={18} />
+              <p>{submitError}</p>
+              {submitDiagnostics.length ? (
+                <button type="button" onClick={() => openErrorDetails(submitDiagnostics)}>View error details</button>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="review-form">
             <label className="field field--title">
@@ -1790,6 +1944,37 @@ export function RecipeImporter() {
       ) : null}
 
       {previewImage ? <ImagePreview image={previewImage} onClose={() => setPreviewImage(null)} /> : null}
+
+      {errorDetails ? (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={() => setErrorDetails(null)}>
+          <div className="dialog diagnostic-dialog" role="dialog" aria-modal="true" aria-labelledby="diagnostic-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="dialog-icon"><CircleAlert size={22} /></div>
+            <p className="eyebrow">Exact processing report</p>
+            <h2 id="diagnostic-title">Error details</h2>
+            <p className="diagnostic-intro">Share the error ID or copy this report. Server-side records are retained for 30 days and contain no photos or credentials.</p>
+            <div className="diagnostic-records">
+              {errorDetails.map((diagnostic) => (
+                <dl key={diagnostic.id}>
+                  <div><dt>Error ID</dt><dd>{diagnostic.id}</dd></div>
+                  <div><dt>Time</dt><dd>{new Date(diagnostic.timestamp).toLocaleString()}</dd></div>
+                  <div><dt>Stage</dt><dd>{diagnostic.stage}</dd></div>
+                  <div><dt>Message</dt><dd>{diagnostic.message}</dd></div>
+                  <div><dt>HTTP status</dt><dd>{diagnostic.httpStatus || "Network error"}</dd></div>
+                  {diagnostic.upstreamStatus ? <div><dt>Provider status</dt><dd>{diagnostic.upstreamStatus}</dd></div> : null}
+                  {diagnostic.model ? <div><dt>Model</dt><dd>{diagnostic.model}</dd></div> : null}
+                  {diagnostic.recipeGroup ? <div><dt>Recipe group</dt><dd>{diagnostic.recipeGroup}</dd></div> : null}
+                  {diagnostic.requestBytes ? <div><dt>Request size</dt><dd>{new Intl.NumberFormat().format(diagnostic.requestBytes)} bytes</dd></div> : null}
+                  {diagnostic.imageCounts ? <div><dt>Images</dt><dd>{diagnostic.imageCounts.total} total ({diagnostic.imageCounts.source} source, {diagnostic.imageCounts.ingredients} ingredient, {diagnostic.imageCounts.steps} step)</dd></div> : null}
+                </dl>
+              ))}
+            </div>
+            <div className="diagnostic-actions">
+              <button className="button button--secondary" type="button" onClick={() => setErrorDetails(null)}>Close</button>
+              <button className="button button--primary" type="button" onClick={() => void copyErrorReport()}><ClipboardCopy size={16} /> {errorReportCopied ? "Copied" : "Copy error report"}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {deleteTarget ? (
         <div className="dialog-backdrop" role="presentation" onMouseDown={() => setDeleteTarget(null)}>
