@@ -38,6 +38,13 @@ type CropPoint = { x: number; y: number };
 type CropQuad = [CropPoint, CropPoint, CropPoint, CropPoint];
 type OcrRegions = { ingredients: CropQuad; steps: CropQuad };
 type PreviewImage = { src: string; alt: string; name: string };
+type ExtractionStage = "preparing" | "sending" | "waiting" | "fallback-loading" | "fallback-reading" | "complete" | "failed";
+type ProcessingRecipeStatus = {
+  group: number;
+  stage: ExtractionStage | "pending";
+  detail: string;
+  progress: number;
+};
 
 type ProcessingDiagnostic = {
   id: string;
@@ -117,9 +124,29 @@ const RECIPE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/ex
 const NOTION_IMPORT_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/import-notion";
 const USAGE_API_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/usage";
 const PROCESSING_ERRORS_URL = "https://recipe-notion-app.pinkas-paolo.workers.dev/v1/processing-errors";
+const RECIPE_REQUEST_TIMEOUT_MS = 105_000;
 
 function publicAsset(path: string) {
   return `${PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`}${path.replace(/^\//, "")}`;
+}
+
+function formatElapsed(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function processingStageLabel(stage: ProcessingRecipeStatus["stage"]) {
+  return {
+    pending: "Queued",
+    preparing: "Preparing photos",
+    sending: "Sending securely",
+    waiting: "Reading with Qwen",
+    "fallback-loading": "Loading fallback OCR",
+    "fallback-reading": "Reading with browser OCR",
+    complete: "Ready",
+    failed: "Stopped",
+  }[stage];
 }
 
 const flowSteps: FlowStep[] = ["upload", "assign", "groups", "processing", "review", "results"];
@@ -572,9 +599,13 @@ function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string, sourceImage
   };
 }
 
-async function extractRecipeWithQwen(group: { number: number; images: BatchImage[] }) {
+async function extractRecipeWithQwen(
+  group: { number: number; images: BatchImage[] },
+  onStage?: (stage: ExtractionStage, detail: string, progress: number) => void,
+) {
   const fallbackTitle = stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`);
   const sourceImageRecords = group.images.slice(0, 4);
+  onStage?.("preparing", "Compressing the original photos for secure upload…", 0.08);
   const sourceImages = await Promise.all(
     sourceImageRecords.map((image) => prepareFullImageForAi(image.url, 900, 0.72)),
   );
@@ -584,6 +615,7 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
   let stepImages: string[];
 
   if (definedImages.length) {
+    onStage?.("preparing", "Cropping the title, ingredient, and step regions…", 0.16);
     titleImages = [await prepareFullImageForAi(definedImages[0].url)];
     ingredientImages = await Promise.all(
       definedImages.map((image) => cropImageForOcr(image.url, image.ocrRegions!.ingredients)),
@@ -592,6 +624,7 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
       definedImages.map((image) => cropImageForOcr(image.url, image.ocrRegions!.steps)),
     );
   } else {
+    onStage?.("preparing", "Preparing the full cookbook pages…", 0.16);
     const fullImages = await Promise.all(sourceImageRecords.map((image) => prepareFullImageForAi(image.url)));
     titleImages = fullImages.slice(0, 1);
     ingredientImages = fullImages;
@@ -599,10 +632,15 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
   }
 
   let response: Response;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), RECIPE_REQUEST_TIMEOUT_MS);
   try {
+    onStage?.("sending", "Uploading the prepared recipe regions…", 0.24);
+    onStage?.("waiting", "Qwen is reading and structuring the German recipe…", 0.32);
     response = await fetch(RECIPE_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         recipeGroup: group.number,
         sourceImages,
@@ -612,8 +650,13 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
       }),
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "The processing service could not be reached.";
-    throw new RecipeProcessingFailure(localDiagnostic("network_request", message, group.number));
+    const timedOut = error instanceof DOMException && error.name === "AbortError";
+    const message = timedOut
+      ? `Qwen did not answer within ${Math.round(RECIPE_REQUEST_TIMEOUT_MS / 1000)} seconds.`
+      : error instanceof Error ? error.message : "The processing service could not be reached.";
+    throw new RecipeProcessingFailure(localDiagnostic(timedOut ? "request_timeout" : "network_request", message, group.number));
+  } finally {
+    window.clearTimeout(timeout);
   }
 
   let payload: { recipe?: QwenRecipe; error?: string; diagnostic?: ProcessingDiagnostic };
@@ -635,6 +678,7 @@ async function extractRecipeWithQwen(group: { number: number; images: BatchImage
       response.status,
     ));
   }
+  onStage?.("complete", "The structured recipe draft is ready.", 1);
   return formatQwenRecipe(payload.recipe, fallbackTitle, sourceImageRecords);
 }
 
@@ -917,6 +961,9 @@ export function RecipeImporter() {
   const [submitDiagnostics, setSubmitDiagnostics] = useState<ProcessingDiagnostic[]>([]);
   const [processingMessage, setProcessingMessage] = useState("Connecting securely to Qwen…");
   const [processingProgress, setProcessingProgress] = useState(0);
+  const [processingRecipes, setProcessingRecipes] = useState<ProcessingRecipeStatus[]>([]);
+  const [processingStartedAt, setProcessingStartedAt] = useState<number | null>(null);
+  const [processingElapsed, setProcessingElapsed] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [notionResults, setNotionResults] = useState<NotionResult[]>([]);
   const [savedBatches, setSavedBatches] = useState<SavedBatchSummary[]>([]);
@@ -925,6 +972,14 @@ export function RecipeImporter() {
   const [errorReportCopied, setErrorReportCopied] = useState(false);
   const [dashboardOpen, setDashboardOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (flow !== "processing" || processingStartedAt === null) return;
+    const updateElapsed = () => setProcessingElapsed(Math.floor((Date.now() - processingStartedAt) / 1000));
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(interval);
+  }, [flow, processingStartedAt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1273,10 +1328,24 @@ export function RecipeImporter() {
     };
   }
 
+  function updateProcessingRecipe(group: number, stage: ProcessingRecipeStatus["stage"], detail: string, progress: number) {
+    setProcessingRecipes((current) => current.map((item) =>
+      item.group === group ? { ...item, stage, detail, progress } : item,
+    ));
+  }
+
   async function createDrafts() {
     goToFlow("processing");
     setProcessingProgress(0);
     setProcessingMessage("Connecting securely to Qwen…");
+    setProcessingStartedAt(Date.now());
+    setProcessingElapsed(0);
+    setProcessingRecipes(groups.map((group) => ({
+      group: group.number,
+      stage: "pending",
+      detail: "Waiting for the previous recipe…",
+      progress: 0,
+    })));
 
     let nextDrafts: Draft[] = [];
     const sampleOnly = groups.every((group) =>
@@ -1286,9 +1355,17 @@ export function RecipeImporter() {
     if (sampleOnly && !navigator.onLine) {
       await new Promise((resolve) => window.setTimeout(resolve, 650));
       nextDrafts = groups.map((group) => buildDraft(group));
+      setProcessingRecipes(groups.map((group) => ({
+        group: group.number,
+        stage: "complete",
+        detail: "Offline sample draft is ready.",
+        progress: 1,
+      })));
       setProcessingProgress(1);
     } else {
       let worker: Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | undefined;
+      let activeOcrGroup = 0;
+      let activeOcrGroupIndex = 0;
       try {
         for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
           const group = groups[groupIndex];
@@ -1296,7 +1373,11 @@ export function RecipeImporter() {
           let parsed: ParsedRecipe;
 
           try {
-            parsed = await extractRecipeWithQwen(group);
+            parsed = await extractRecipeWithQwen(group, (stage, detail, progress) => {
+              updateProcessingRecipe(group.number, stage, detail, progress);
+              setProcessingProgress((groupIndex + progress) / groups.length);
+              setProcessingMessage(`Recipe ${groupIndex + 1} of ${groups.length}: ${detail}`);
+            });
           } catch (error) {
             const diagnostic = await persistClientDiagnostic(error instanceof RecipeProcessingFailure
               ? error.diagnostic
@@ -1305,13 +1386,24 @@ export function RecipeImporter() {
                   error instanceof Error ? error.message : "The recipe images could not be prepared for Qwen.",
                   group.number,
                 ));
-            setProcessingMessage(`Qwen was unavailable. Using German browser OCR for recipe ${groupIndex + 1}…`);
+            activeOcrGroup = group.number;
+            activeOcrGroupIndex = groupIndex;
+            updateProcessingRecipe(group.number, "fallback-loading", `Qwen stopped: ${diagnostic.message} Loading German browser OCR…`, 0.42);
+            setProcessingProgress((groupIndex + 0.42) / groups.length);
+            setProcessingMessage(`Recipe ${groupIndex + 1} of ${groups.length}: loading German browser OCR…`);
             if (!worker) {
               const { createWorker, PSM } = await import("tesseract.js");
               worker = await createWorker(["deu"], 1, {
                 logger(message) {
                   if (message.status === "recognizing text" && typeof message.progress === "number") {
-                    setProcessingProgress(Math.min(0.96, message.progress));
+                    const recipeProgress = 0.48 + (message.progress * 0.42);
+                    updateProcessingRecipe(
+                      activeOcrGroup,
+                      "fallback-reading",
+                      `German browser OCR is reading text — ${Math.round(message.progress * 100)}%`,
+                      recipeProgress,
+                    );
+                    setProcessingProgress((activeOcrGroupIndex + recipeProgress) / groups.length);
                   }
                 },
               });
@@ -1326,6 +1418,7 @@ export function RecipeImporter() {
               const confidences: number[] = [];
 
               for (const image of definedImages) {
+                updateProcessingRecipe(group.number, "fallback-reading", `Reading ingredient and step regions from ${image.name}…`, 0.55);
                 const ingredientsUrl = await cropImageForOcr(image.url, image.ocrRegions!.ingredients);
                 const stepsUrl = await cropImageForOcr(image.url, image.ocrRegions!.steps);
                 const ingredientResult = await worker.recognize(ingredientsUrl);
@@ -1355,6 +1448,7 @@ export function RecipeImporter() {
               const pages: string[] = [];
               const confidences: number[] = [];
               for (const image of group.images) {
+                updateProcessingRecipe(group.number, "fallback-reading", `Reading the full page ${image.name}…`, 0.55);
                 const result = await worker.recognize(image.url);
                 const text = result.data.text.trim();
                 if (text.length >= 12) {
@@ -1372,6 +1466,7 @@ export function RecipeImporter() {
           }
 
           nextDrafts.push(buildDraft(group, parsed));
+          updateProcessingRecipe(group.number, "complete", "Recipe draft is ready for review.", 1);
           setProcessingProgress((groupIndex + 1) / groups.length);
         }
       } catch (error) {
@@ -1381,6 +1476,11 @@ export function RecipeImporter() {
               "browser_ocr",
               error instanceof Error ? error.message : "The browser OCR could not create the recipe draft.",
             ));
+        setProcessingRecipes((current) => current.map((item) => item.stage === "complete" ? item : {
+          ...item,
+          stage: "failed",
+          detail: `${diagnostic.message} Error ${diagnostic.id}.`,
+        }));
         nextDrafts = groups.map((group) =>
           buildDraft(group, {
             title: stripExtension(group.images[0]?.name ?? `Recipe ${group.number}`),
@@ -1827,6 +1927,26 @@ export function RecipeImporter() {
           <div className="processing-bar" role="progressbar" aria-label="Recipe extraction progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(processingProgress * 100)}>
             <span style={{ width: `${Math.max(8, processingProgress * 100)}%` }} />
           </div>
+          <div className="processing-summary">
+            <span>Elapsed {formatElapsed(processingElapsed)}</span>
+            <span>{Math.round(processingProgress * 100)}% overall</span>
+          </div>
+          <div className="processing-recipes" aria-label="Detailed recipe processing progress">
+            {processingRecipes.map((recipe, index) => (
+              <article className={`processing-recipe is-${recipe.stage}`} key={recipe.group}>
+                <div className="processing-recipe__number">{recipe.stage === "complete" ? <Check size={17} /> : index + 1}</div>
+                <div>
+                  <div className="processing-recipe__heading">
+                    <strong>Recipe {index + 1}</strong>
+                    <span>{processingStageLabel(recipe.stage)}</span>
+                  </div>
+                  <p>{recipe.detail}</p>
+                  <div className="processing-recipe__bar" aria-hidden="true"><span style={{ width: `${Math.max(3, recipe.progress * 100)}%` }} /></div>
+                </div>
+              </article>
+            ))}
+          </div>
+          <p className="processing-note">Recipes are handled one after another to keep mobile uploads stable. Qwen is limited to 90 seconds per recipe; after that, German browser OCR takes over automatically.</p>
         </section>
       ) : null}
 

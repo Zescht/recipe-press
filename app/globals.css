@@ -253,6 +253,20 @@ h3 { margin-bottom:6px; font-size:1.5rem; }
 .processing-view p,.results-view>div>p { max-width:560px; color:#bcbdb5; line-height:1.6; }
 .processing-bar { width:min(100%,440px); height:7px; margin-top:18px; overflow:hidden; background:#393a34; }
 .processing-bar span { min-width:8%; height:100%; display:block; background:var(--acid); transition:width .22s ease; }
+.processing-summary { width:min(100%,680px); margin:8px auto 0; display:flex; justify-content:space-between; color:#8f9087; font-family:var(--mono); font-size:.68rem; letter-spacing:.04em; text-transform:uppercase; }
+.processing-recipes { width:min(100%,680px); margin:28px auto 0; border-top:1px solid #4d4f48; text-align:left; }
+.processing-recipe { padding:16px 0; border-bottom:1px solid #4d4f48; display:grid; grid-template-columns:38px minmax(0,1fr); gap:13px; }
+.processing-recipe__number { width:34px; height:34px; border:1px solid #6d6f65; display:grid; place-items:center; color:#bcbdb5; font:700 .72rem/1 var(--mono); }
+.processing-recipe__heading { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+.processing-recipe__heading strong { color:#fff; font:700 .76rem/1.3 var(--mono); text-transform:uppercase; }
+.processing-recipe__heading span { color:var(--acid); font:700 .65rem/1.3 var(--mono); letter-spacing:.04em; text-align:right; text-transform:uppercase; }
+.processing-recipe p { margin:5px 0 10px; color:#bcbdb5; font-size:.78rem; line-height:1.45; }
+.processing-recipe__bar { height:3px; overflow:hidden; background:#393a34; }
+.processing-recipe__bar span { height:100%; display:block; background:#8f9087; transition:width .22s ease; }
+.processing-recipe.is-complete .processing-recipe__number { border-color:var(--acid); background:var(--acid); color:var(--ink); }
+.processing-recipe.is-complete .processing-recipe__bar span { background:var(--acid); }
+.processing-recipe.is-failed .processing-recipe__number,.processing-recipe.is-failed .processing-recipe__heading span { border-color:#ff7d78; color:#ff7d78; }
+.processing-note { width:min(100%,680px); margin:16px auto 0; color:#8f9087!important; font:500 .67rem/1.55 var(--mono); }
 
 .review-view { padding-bottom:28px; }
 .review-topline { margin-bottom:22px; padding-bottom:13px; border-bottom:1px solid var(--ink); }

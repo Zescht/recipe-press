@@ -9,6 +9,7 @@ const ERROR_INDEX_KEY = "recipe-press:processing-errors:v1";
 const ERROR_KEY_PREFIX = "recipe-press:processing-error:";
 const MAX_ERROR_RECORDS = 50;
 const ERROR_TTL_SECONDS = 60 * 60 * 24 * 30;
+const OPENROUTER_TIMEOUT_MS = 90_000;
 
 const ALLOWED_ORIGINS = new Set([
   "https://zescht.github.io",
@@ -636,9 +637,12 @@ const worker = {
     addImageSection(userContent, "ZUBEREITUNGSBEREICH(E):", stepImages);
 
     let upstream;
+    const openRouterController = new AbortController();
+    const openRouterTimeout = setTimeout(() => openRouterController.abort(), OPENROUTER_TIMEOUT_MS);
     try {
       upstream = await fetch(OPENROUTER_URL, {
         method: "POST",
+        signal: openRouterController.signal,
         headers: {
           Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
@@ -662,14 +666,19 @@ const worker = {
         }),
       });
     } catch (error) {
+      const timedOut = error instanceof Error && error.name === "AbortError";
       return processingErrorResponse(env, origin, {
-        stage: "openrouter_request",
-        message: error instanceof Error ? `OpenRouter could not be reached: ${error.message}` : "OpenRouter could not be reached.",
-        httpStatus: 502,
+        stage: timedOut ? "openrouter_timeout" : "openrouter_request",
+        message: timedOut
+          ? `OpenRouter did not answer within ${Math.round(OPENROUTER_TIMEOUT_MS / 1000)} seconds.`
+          : error instanceof Error ? `OpenRouter could not be reached: ${error.message}` : "OpenRouter could not be reached.",
+        httpStatus: timedOut ? 504 : 502,
         requestBytes,
         recipeGroup: body?.recipeGroup,
         imageCounts,
       });
+    } finally {
+      clearTimeout(openRouterTimeout);
     }
 
     let result;
