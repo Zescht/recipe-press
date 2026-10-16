@@ -1034,11 +1034,17 @@ export function RecipeImporter() {
         const available = restored.filter((image): image is BatchImage => Boolean(image));
         setBatchId(route.id);
         setImages(available);
-        setDrafts(saved.drafts ?? []);
+        const savedDrafts = saved.drafts ?? [];
+        const recoveredDrafts = route.flow === "processing" && savedDrafts.length
+          ? savedDrafts.map((draft, index) => index === 0 ? { ...draft, visited: true } : draft)
+          : savedDrafts;
+        setDrafts(recoveredDrafts);
         setNotionResults(saved.notionResults ?? []);
         setImageIndex(Math.min(saved.imageIndex ?? 0, Math.max(available.length - 1, 0)));
-        setDraftIndex(Math.min(saved.draftIndex ?? 0, Math.max((saved.drafts?.length ?? 1) - 1, 0)));
-        const restoredFlow = route.flow === "processing" ? "groups" : route.flow;
+        setDraftIndex(Math.min(saved.draftIndex ?? 0, Math.max((recoveredDrafts.length || 1) - 1, 0)));
+        const restoredFlow = route.flow === "processing"
+          ? recoveredDrafts.length ? "review" : "groups"
+          : route.flow;
         setFlow(restoredFlow);
         if (restoredFlow !== route.flow) {
           window.history.replaceState({}, "", batchUrl(route.id, restoredFlow));
@@ -1496,13 +1502,11 @@ export function RecipeImporter() {
     }
 
     setProcessingMessage("Preparing the review…");
-    window.setTimeout(() => {
-      if (nextDrafts[0]) nextDrafts[0].visited = true;
-      setDrafts(nextDrafts);
-      setDraftIndex(0);
-      setDetailsOpen(false);
-      goToFlow("review");
-    }, 250);
+    const reviewDrafts = nextDrafts.map((draft, index) => index === 0 ? { ...draft, visited: true } : draft);
+    setDrafts(reviewDrafts);
+    setDraftIndex(0);
+    setProcessingStartedAt(null);
+    goToFlow("review");
   }
 
   function updateDraft(patch: Partial<Draft>) {
@@ -1557,7 +1561,6 @@ export function RecipeImporter() {
             draftPosition === index ? { ...draft, visited: true } : draft,
           ),
         );
-        setDetailsOpen(false);
         return;
       }
     }
