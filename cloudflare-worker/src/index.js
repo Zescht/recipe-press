@@ -76,6 +76,7 @@ Regeln:
 - Beschreibender Fließtext oberhalb oder neben Zutaten und Zubereitung ist in der Regel Buchtext und kein Rezeptinhalt. Übernimm ihn nur, wenn er eine konkrete Servier-, Vorbereitungs- oder Aufbewahrungsinformation enthält.
 - Ignoriere Seitenzahlen, laufende Kopfzeilen, dekorative Texte, Bildunterschriften und allgemeine Einleitungstexte, sofern sie keine wichtige Servier-, Aufbewahrungs- oder Vorbereitungsaussage enthalten.
 - ingredients enthält jede Zutat genau einmal, mit Menge, Einheit und Zubereitungshinweis.
+- Jeder ingredients-Eintrag ist eine einzige, direkt lesbare deutsche Textzeile wie "4 Stück Knoblauchzehen, zerdrückt". Verwende dort niemals JSON, Objekte, Schlüssel wie amount/unit/name oder serialisierte Datenstrukturen.
 - Sortiere Zutaten ohne Zwischenüberschriften in dieser Reihenfolge: (1) Gemüse/Obst, (2) Fleisch/Fisch/Protein, (3) Milch-/Joghurtprodukte, (4) Sonstiges, (5) typische Vorräte wie Öl, Salz und Pfeffer. Behalte innerhalb einer Gruppe die Quellreihenfolge bei.
 - phases enthält die Zubereitung in sinnvollen Phasen. Jede Phase hat einen kurzen deutschen Namen und vollständige Arbeitsschritte. Bewahre Fakten, Reihenfolge, Temperaturen, Zeiten und Sichtmerkmale.
 - servings ist nur die Zahl, wenn eindeutig vorhanden, sonst eine leere Zeichenfolge.
@@ -272,6 +273,36 @@ function parseModelJson(text) {
   return JSON.parse(cleaned);
 }
 
+function modelIngredientParts(value) {
+  if (Array.isArray(value)) return value.flatMap(modelIngredientParts);
+  if (value && typeof value === "object") {
+    const amount = String(value.amount ?? value.quantity ?? value.menge ?? "").trim();
+    const unit = String(value.unit ?? value.einheit ?? "").trim();
+    const name = String(value.name ?? value.ingredient ?? value.zutat ?? "").trim();
+    const combined = [amount, unit, name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    return combined ? [combined] : [];
+  }
+  if (typeof value !== "string") return [];
+  const cleaned = value.replace(/^[-•·]\s*/, "").trim();
+  if (!cleaned) return [];
+  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
+    try {
+      return modelIngredientParts(JSON.parse(cleaned));
+    } catch {
+      // Preserve malformed text for manual review rather than dropping an ingredient.
+    }
+  }
+  return [cleaned];
+}
+
+function normalizeModelRecipe(recipe) {
+  if (!recipe || typeof recipe !== "object") throw new Error("The AI response was not a recipe object.");
+  return {
+    ...recipe,
+    ingredients: (Array.isArray(recipe.ingredients) ? recipe.ingredients : []).flatMap(modelIngredientParts),
+  };
+}
+
 function notionHeaders(token, jsonContent = true) {
   return {
     Authorization: `Bearer ${token}`,
@@ -358,7 +389,13 @@ async function importRecipeToNotion(recipe, env) {
   const title = String(recipe?.title || "").trim();
   const difficulty = recipe?.difficulty;
   const courses = Array.isArray(recipe?.courses) ? recipe.courses.filter(Boolean) : [];
-  if (!title || !recipe?.ingredients || !recipe?.steps || !courses.length || !["Daily", "Special"].includes(difficulty)) {
+  const ingredients = String(recipe?.ingredients || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .flatMap(modelIngredientParts)
+    .map((line) => `- ${line}`)
+    .join("\n");
+  if (!title || !ingredients || !recipe?.steps || !courses.length || !["Daily", "Special"].includes(difficulty)) {
     throw new Error("The recipe is missing required review fields.");
   }
   const imageUploadId = await uploadImageToNotion(recipe.imageDataUrl, title, env.NOTION_TOKEN);
@@ -367,7 +404,7 @@ async function importRecipeToNotion(recipe, env) {
     Name: { title: richText(title) },
     Course: { multi_select: courses.map((name) => ({ name })) },
     Difficulty: { select: { name: difficulty } },
-    Ingredients: { rich_text: richText(recipe.ingredients) },
+    Ingredients: { rich_text: richText(ingredients) },
     Steps: { rich_text: richText(recipe.steps) },
   };
   if (Number.isFinite(servings)) properties.Servings = { number: servings };
@@ -709,7 +746,7 @@ const worker = {
     }
 
     try {
-      const recipe = parseModelJson(extractMessageText(result?.choices?.[0]?.message));
+      const recipe = normalizeModelRecipe(parseModelJson(extractMessageText(result?.choices?.[0]?.message)));
       await recordUsage(env, result?.usage);
       return json(
         {

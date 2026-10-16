@@ -290,7 +290,7 @@ type QwenRecipe = {
   title: string;
   servings: string;
   displayImageNumber: number;
-  ingredients: string[];
+  ingredients: unknown[];
   phases: { name: string; steps: string[] }[];
   warnings: string[];
 };
@@ -339,6 +339,45 @@ function ingredientRank(line: string) {
   if (includesAny(["beef", "rind", "chicken", "huhn", "pork", "schwein", "fish", "fisch", "salmon", "lachs", "tofu", "egg", "ei ", "eggs", "lentil", "linse", "bean", "bohne"])) return 1;
   if (includesAny(["onion", "zwiebel", "garlic", "knoblauch", "tomato", "tomate", "auberg", "potato", "kartoff", "carrot", "karotte", "möhre", "pepper", "paprika", "lemon", "zitrone", "lime", "apple", "apfel", "herb", "kräuter", "thyme", "thymian", "oregano", "spinach", "spinat", "cabbage", "kohl"])) return 0;
   return 3;
+}
+
+function ingredientValueParts(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(ingredientValueParts);
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const amount = String(record.amount ?? record.quantity ?? record.menge ?? "").trim();
+    const unit = String(record.unit ?? record.einheit ?? "").trim();
+    const name = String(record.name ?? record.ingredient ?? record.zutat ?? "").trim();
+    const combined = [amount, unit, name].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    return combined ? [combined] : [];
+  }
+  if (typeof value !== "string") return [];
+
+  const cleaned = value.replace(/^[-•·]\s*/, "").trim();
+  if (!cleaned) return [];
+  if ((cleaned.startsWith("{") && cleaned.endsWith("}")) || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
+    try {
+      return ingredientValueParts(JSON.parse(cleaned));
+    } catch {
+      // Keep malformed model text editable instead of discarding it.
+    }
+  }
+  return [cleaned];
+}
+
+function formatIngredientValues(values: unknown[]) {
+  return values
+    .flatMap(ingredientValueParts)
+    .filter(Boolean)
+    .map((line, index) => ({ line, index, rank: ingredientRank(line) }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ line }) => `- ${line}`)
+    .join("\n");
+}
+
+function normalizeIngredientText(value: string) {
+  if (!value.trim() || value.includes("[Review and add the extracted ingredients]")) return value;
+  return formatIngredientValues(value.replace(/\r/g, "").split("\n"));
 }
 
 function parseRecipeText(rawText: string, fallbackTitle: string, confidence: number): ParsedRecipe {
@@ -572,13 +611,7 @@ async function prepareFullImageForAi(imageUrl: string, maxDimension = 1800, qual
 }
 
 function formatQwenRecipe(recipe: QwenRecipe, fallbackTitle: string, sourceImages: BatchImage[]): ParsedRecipe {
-  const ingredients = recipe.ingredients
-    .map((line) => line.replace(/^[-â€¢Â·]\s*/, "").trim())
-    .filter(Boolean)
-    .map((line, index) => ({ line, index, rank: ingredientRank(line) }))
-    .sort((left, right) => left.rank - right.rank || left.index - right.index)
-    .map(({ line }) => `- ${line}`)
-    .join("\n");
+  const ingredients = formatIngredientValues(Array.isArray(recipe.ingredients) ? recipe.ingredients : []);
   const steps = recipe.phases
     .filter((phase) => phase.steps?.length)
     .map((phase) => {
@@ -1034,7 +1067,10 @@ export function RecipeImporter() {
         const available = restored.filter((image): image is BatchImage => Boolean(image));
         setBatchId(route.id);
         setImages(available);
-        const savedDrafts = saved.drafts ?? [];
+        const savedDrafts = (saved.drafts ?? []).map((draft) => ({
+          ...draft,
+          ingredients: normalizeIngredientText(draft.ingredients),
+        }));
         const recoveredDrafts = route.flow === "processing" && savedDrafts.length
           ? savedDrafts.map((draft, index) => index === 0 ? { ...draft, visited: true } : draft)
           : savedDrafts;
@@ -1621,7 +1657,7 @@ export function RecipeImporter() {
               courses: draft.courses,
               difficulty: draft.difficulty,
               servings: draft.servings,
-              ingredients: draft.ingredients,
+              ingredients: normalizeIngredientText(draft.ingredients),
               steps: draft.steps,
               imageDataUrl,
             },
